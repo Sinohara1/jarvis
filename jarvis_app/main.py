@@ -29,6 +29,14 @@ def main() -> None:
     threading.excepthook = lambda a: log.error("thread %s crashed", a.thread.name if a.thread else "?",
                                               exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
 
+    if getattr(sys, "frozen", False):
+        # Anything we launch (apps, our own relaunch after a version switch) must not inherit
+        # PyInstaller's onefile child variables, or another PyInstaller exe would try to use our _MEI dir.
+        import os
+        for k in [k for k in os.environ if k.upper().startswith(("_PYI_", "_MEIPASS"))]:
+            os.environ.pop(k, None)
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
     if "--selftest" in sys.argv:
         from .selftest import run
         sys.exit(run())

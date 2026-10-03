@@ -188,6 +188,12 @@ def test_versions_parse(monkeypatch=None):
         txt = open(bat, encoding="utf-8").read()
         assert 'find " 11 "' in txt and "taskkill /F /PID 22" in txt and 'start "" "C:\\T\\Jarvis.exe"' in txt
         assert "taskkill /F /IM" not in txt
+        assert "set PYINSTALLER_RESET_ENVIRONMENT=1" in txt and "set _PYI_APPLICATION_HOME_DIR=" in txt
+        assert txt.index("copied OK") < txt.index('start ""')
+    os.environ["_PYI_APPLICATION_HOME_DIR"] = "x"; os.environ["JARVIS_AUTOTEST"] = "y"
+    env = u.clean_env()
+    assert "_PYI_APPLICATION_HOME_DIR" not in env and "JARVIS_AUTOTEST" not in env and env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    del os.environ["_PYI_APPLICATION_HOME_DIR"], os.environ["JARVIS_AUTOTEST"]
     u._cache.update(t=0.0, data=None)
 
 
