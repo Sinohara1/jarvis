@@ -191,7 +191,8 @@ def _process_image(pid: int) -> str:
 def launch_swap(bat: str) -> None:
     # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP — survives our exit, no console flash
     flags = (0x08000000 | 0x00000200) if sys.platform == "win32" else 0
-    subprocess.Popen(["cmd.exe", "/c", bat], cwd=os.path.dirname(bat), creationflags=flags, close_fds=True)
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("JARVIS_")}  # no test hooks in the new exe
+    subprocess.Popen(["cmd.exe", "/c", bat], cwd=os.path.dirname(bat), creationflags=flags, close_fds=True, env=env)
 
 
 def install(release: dict, on_progress=None) -> str:

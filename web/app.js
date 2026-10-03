@@ -66,6 +66,12 @@ async function start() {
 window.J = {
   autotest(cmd) {   // set only via JARVIS_AUTOTEST for automated screenshots
     if (cmd.startsWith('tab:')) { selectTab(cmd.slice(4)); return; }
+    if (cmd.startsWith('click:')) {   // click:sel1|sel2|… — clicks in order, waiting up to 15 s for each element
+      const sels = cmd.slice(6).split('|');
+      (async () => { for (const sel of sels) { let el = null; for (let i = 0; i < 150 && !el; i++) { el = document.querySelector(sel); if (!el) await new Promise((r) => setTimeout(r, 100)); }
+        API.log_js('autotest click ' + sel + (el ? '' : ' — not found')); if (!el) return; el.scrollIntoView({ block: 'center' }); el.click(); await new Promise((r) => setTimeout(r, 800)); } })();
+      return;
+    }
     if (cmd === 'chat') { selectTab('home'); enterChat(true); return; }
     $('#input').value = cmd; send();
   },
