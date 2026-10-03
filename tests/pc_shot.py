@@ -14,9 +14,10 @@ def find_main():
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Jarvis.exe", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
     pids = {int(l.split('","')[1]) for l in out.splitlines() if l.startswith('"Jarvis.exe"')}
     best = [0, 0]
+    cls = ctypes.create_unicode_buffer(200)
     def cb(h, l):
         pid = W.DWORD(); u.GetWindowThreadProcessId(h, ctypes.byref(pid))
-        if pid.value in pids and u.IsWindowVisible(h):
+        if pid.value in pids and u.IsWindowVisible(h) and u.GetClassNameW(h, cls, 200) and cls.value.startswith('WindowsForms'):
             r = W.RECT(); u.GetWindowRect(h, ctypes.byref(r))
             a = (r.right - r.left) * (r.bottom - r.top)
             if a > best[1]:
@@ -29,6 +30,9 @@ def find_main():
 hwnd = u.FindWindowW(None, sys.argv[2]) if len(sys.argv) > 2 else find_main()
 if not hwnd:
     print("window not found"); sys.exit(1)
+if u.IsIconic(hwnd):  # minimized → restore without stealing focus, PrintWindow can't render icons
+    import time
+    u.ShowWindow(hwnd, 4); time.sleep(1.2)
 r = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
 w, h = r.right - r.left, r.bottom - r.top
 hdc = u.GetWindowDC(hwnd); mdc = g.CreateCompatibleDC(hdc); bmp = g.CreateCompatibleBitmap(hdc, w, h)
