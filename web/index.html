@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Джарвис</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-state="idle">
+<canvas id="bg"></canvas>
+<div id="shade"></div>
+<div id="app">
+  <header id="top" class="pywebview-drag-region">
+    <div id="winctl">
+      <button data-win="min" title="Свернуть"></button>
+      <button data-win="max" title="Развернуть"></button>
+      <button data-win="close" class="close" title="Закрыть (в трей)"></button>
+    </div>
+    <nav id="tabs"></nav>
+    <button id="burger" class="icon-btn" title="Меню"></button>
+  </header>
+
+  <aside id="rail">
+    <button id="rail-home" class="rail-btn active" title="Главная"></button>
+    <button id="rail-new" class="rail-btn" title="Новый чат"></button>
+  </aside>
+  <button id="grid-btn" class="icon-btn" title="Ещё"></button>
+
+  <main id="views">
+    <section class="view active" id="v-home">
+      <div id="hero">
+        <h1 id="wordmark"><span class="wm">Jarvis</span><span class="spark"></span></h1>
+        <p id="greet">Пора работать, Вова?</p>
+      </div>
+      <div id="chat"><div id="msgs"></div></div>
+      <div id="composer">
+        <div id="status"><span class="dot"></span><span class="txt"></span></div>
+        <div class="card">
+          <div class="crow crow1">
+            <button id="plus" class="sq" title="Действия"></button>
+            <input id="input" type="text" autocomplete="off" spellcheck="false" placeholder="Спросите о чём угодно...">
+            <button id="slash" class="sq boxed" title="Команды"></button>
+            <button id="clip" class="sq" title="Приложить снимок экрана"></button>
+            <button id="send" class="sq" title="Отправить (Enter)"></button>
+            <button id="mic" class="sq" title="Говорить"></button>
+          </div>
+          <div class="crow crow2">
+            <label class="tgl-wrap" id="confirm-wrap" title="Перед открытием программ и сайтов Джарвис спросит разрешение">
+              <span class="lbl">Подтверждать опасные действия</span><span id="confirm-tgl" class="toggle"></span>
+            </label>
+            <button id="wake-btn" class="chip" title="Слово-активатор «Hey Jarvis»"></button>
+            <button id="voice-btn" class="chip" title="Озвучивать ответы"></button>
+            <button id="model-btn" class="chip" title="Модель"></button>
+            <button id="watch-btn" class="chip" title="Как часто смотреть на экран во время фокуса"></button>
+          </div>
+        </div>
+      </div>
+      <div id="quick">
+        <button data-q="last"></button>
+        <button data-q="cmd">Создай команду</button>
+        <button data-q="ask">Что ты умеешь?</button>
+      </div>
+    </section>
+
+    <section class="view" id="v-commands"><div class="page"><div class="col" id="p-commands"></div></div></section>
+    <section class="view" id="v-model"><div class="page"><div class="col" id="p-model"></div></div></section>
+    <section class="view" id="v-voice"><div class="page"><div class="col" id="p-voice"></div></div></section>
+    <section class="view" id="v-ai"><div class="page"><div class="col" id="p-ai"></div></div></section>
+    <section class="view" id="v-focus"><div class="page"><div class="col" id="p-focus"></div></div></section>
+    <section class="view" id="v-settings"><div class="page"><div class="col" id="p-settings"></div></div></section>
+  </main>
+
+  <div class="rz n" data-edge="n"></div><div class="rz s" data-edge="s"></div>
+  <div class="rz e" data-edge="e"></div><div class="rz w" data-edge="w"></div>
+  <div class="rz ne" data-edge="ne"></div><div class="rz nw" data-edge="nw"></div>
+  <div class="rz se" data-edge="se"></div><div class="rz sw" data-edge="sw"></div>
+  <div id="pop" class="hidden"></div>
+  <div id="toasts"></div>
+</div>
+<script src="icons.js"></script>
+<script src="bg.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

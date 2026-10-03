@@ -1,0 +1,10 @@
+numpy
+sounddevice
+pillow
+edge-tts
+keyboard
+pystray
+onnxruntime
+requests
+pywebview
+pyinstaller
