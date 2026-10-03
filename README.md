@@ -5,9 +5,9 @@
 не залипал в TikTok и шортсы во время фокус-сессий.
 
 ## Как скачать
-1. Открой страницу **[Releases](https://github.com/Sinohara1/jarvis/releases)** и скачай `Jarvis.exe`
+1. Открой страницу **[Releases](https://github.com/Sinohara1/jarvis-releases/releases)** и скачай `Jarvis.exe`
    из последней версии. Прямая ссылка на последнюю версию:
-   https://github.com/Sinohara1/jarvis/releases/latest/download/Jarvis.exe
+   https://github.com/Sinohara1/jarvis-releases/releases/latest/download/Jarvis.exe
 2. Положи `Jarvis.exe` в любую папку (например, на Рабочий стол) и запусти.
    Windows SmartScreen может предупредить о неизвестном издателе. Нажми «Подробнее» → «Выполнить в любом случае».
 3. Если окно не открывается, установи [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)

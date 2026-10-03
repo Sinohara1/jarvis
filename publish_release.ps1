@@ -1,11 +1,11 @@
-# Publish Jarvis.exe as a GitHub Release of the public repo Sinohara1/jarvis.
+# Publish Jarvis.exe as a GitHub Release of the public releases-only repo Sinohara1/jarvis-releases (code lives in the private Sinohara1/jarvis).
 # Requires gh CLI (gh auth login). No token is stored in the project or the exe.
 # Usage: .\publish_release.ps1 -Version 1.1.0 [-ExePath .\Jarvis.exe] [-Notes "что нового"] [-Prerelease]
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
     [string]$ExePath = ".\Jarvis.exe",
-    [string]$Repo = "Sinohara1/jarvis",
+    [string]$Repo = "Sinohara1/jarvis-releases",
     [string]$Notes = "",
     [switch]$Prerelease
 )
