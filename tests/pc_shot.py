@@ -8,7 +8,25 @@ try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     pass
-hwnd = u.FindWindowW(None, sys.argv[2] if len(sys.argv) > 2 else "Джарвис")
+def find_main():
+    """Largest visible top-level window owned by a Jarvis.exe process (title-independent)."""
+    import subprocess
+    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Jarvis.exe", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
+    pids = {int(l.split('","')[1]) for l in out.splitlines() if l.startswith('"Jarvis.exe"')}
+    best = [0, 0]
+    def cb(h, l):
+        pid = W.DWORD(); u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        if pid.value in pids and u.IsWindowVisible(h):
+            r = W.RECT(); u.GetWindowRect(h, ctypes.byref(r))
+            a = (r.right - r.left) * (r.bottom - r.top)
+            if a > best[1]:
+                best[:] = [h, a]
+        return True
+    u.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, W.HWND, W.LPARAM)(cb), 0)
+    return best[0]
+
+
+hwnd = u.FindWindowW(None, sys.argv[2]) if len(sys.argv) > 2 else find_main()
 if not hwnd:
     print("window not found"); sys.exit(1)
 r = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
