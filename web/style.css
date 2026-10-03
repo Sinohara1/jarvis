@@ -296,3 +296,15 @@ body.maximized .rz { display: none; }
 .mtitle { font-size: 16px; font-weight: 800; margin-bottom: 10px; }
 .mtext { color: #c4c4c4; font-size: 13px; line-height: 1.5; font-weight: 500; }
 .mbtns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+/* name + character (v1.1) */
+#wordmark.long { font-size: 54px; } #wordmark.xlong { font-size: 42px; }
+.msg .col { display: flex; flex-direction: column; min-width: 0; max-width: 100%; }
+.msg .who { font-size: 11px; font-weight: 700; color: #9d9d9d; margin: 0 0 3px 2px; letter-spacing: .2px; }
+.pchips { display: flex; flex-wrap: wrap; gap: 8px; }
+.pchip { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 13px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  color: #d6d6d6; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08); transition: background .15s, color .15s, border-color .15s; }
+.pchip:hover { background: rgba(255,255,255,.11); color: #fff; }
+.pchip.on { background: #f2f2f2; color: #111; border-color: #f2f2f2; box-shadow: 0 4px 16px rgba(255,255,255,.12); }
+.vsug { margin-top: 10px; border-top: none !important; background: rgba(0,0,0,.18); border-radius: 12px; padding: 8px 12px; }
+.msg.jarvis .av { margin-top: 17px; }

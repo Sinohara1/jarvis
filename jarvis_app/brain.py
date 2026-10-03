@@ -12,6 +12,7 @@ from datetime import datetime
 
 from . import providers as P
 from .actions import TOOLS, time_info
+from . import persona
 from .config import PROVIDERS, api_key_for
 
 log = logging.getLogger("jarvis")
@@ -19,19 +20,32 @@ log = logging.getLogger("jarvis")
 MAX_TOOL_ROUNDS = 5
 MAX_HISTORY = 30
 
-SYSTEM_PROMPT = """Ты — Джарвис, личный голосовой ИИ-ассистент Вовы на его компьютере с Windows.
-Характер: спокойный, остроумный, заботливый, как Джарвис из «Железного человека», но без пафоса. Обращайся на «ты».
-Главная миссия: помогать Вове реально делать то, что ему нужно, а не залипать в TikTok и шортсы. Мягко, но настойчиво возвращай к делу.
+SYSTEM_PROMPT = """Ты — {name}, личный голосовой ИИ-ассистент {user_gen} на компьютере с Windows. Тебя зовут {name}, так и представляйся.
+Твой характер: {character}
+Обращайся на «ты». Держи этот характер в каждом ответе, но оставайся полезным.
+Главная миссия: помогать {user_dat} реально делать то, что нужно, а не залипать в TikTok и шортсы. Возвращай к делу в своём стиле.
 
 Правила ответа:
 - Твои ответы озвучиваются голосом. Отвечай коротко и разговорно: обычно 1–2 предложения, максимум 3–4, если просят объяснить.
 - Никакого markdown, списков, эмодзи и ссылок в тексте. Числа и время пиши так, как их удобно произносить.
-- Отвечай по-русски, если Вова не попросил иначе.
+- Отвечай по-русски, если не попросили иначе.
 - Если нужно действие на компьютере — вызывай инструменты, а не описывай, как это сделать. После действия коротко подтверди.
-- Когда Вова говорит, чем сейчас занимается и сколько времени («делаю домашку по физике 40 минут») — сразу вызывай start_focus.
+- Когда пользователь говорит, чем сейчас занимается и сколько времени («делаю домашку по физике 40 минут») — сразу вызывай start_focus.
 - Ты не умеешь удалять файлы, закрывать программы и отправлять сообщения. Если просят — честно скажи, что пока так не умеешь.
 - Если не расслышал или запрос непонятен — переспроси одной короткой фразой.
 """
+
+
+def build_system_prompt(settings: dict) -> str:
+    user = str(settings.get("user_name") or "").strip()
+    name = persona.assistant_name(settings)
+    head = SYSTEM_PROMPT.format(
+        name=name, character=persona.character_text(settings),
+        user_gen=f"пользователя по имени {user}" if user else "пользователя",
+        user_dat=f"пользователю ({user})" if user else "пользователю")
+    if user:
+        head += f"Пользователя зовут {user}.\n"
+    return head
 
 SCREEN_SCHEMA = {
     "type": "object",
@@ -85,13 +99,13 @@ class Brain:
         ctx = self.get_context() or ""
         st = self.get_settings()
         extra = ""
-        persona = str(st.get("persona") or "").strip()
-        if persona:
-            extra += f"\nДополнительные пожелания Вовы к твоему поведению (соблюдай их):\n{persona[:2000]}\n"
+        wishes = str(st.get("persona") or "").strip()
+        if wishes:
+            extra += f"\nДополнительные пожелания пользователя к твоему поведению (соблюдай их):\n{wishes[:2000]}\n"
         if st.get("confirm_actions"):
             extra += ("\nРежим подтверждения включён: прежде чем открыть программу, файл или сайт, коротко спроси "
                       "«Открыть …?» и вызывай инструмент только после явного «да».\n")
-        return (SYSTEM_PROMPT + extra
+        return (build_system_prompt(st) + extra
                 + f"\nСейчас: {ti['weekday']}, {ti['date']}, {ti['time']}.\n"
                 + (ctx + "\n" if ctx else ""))
 

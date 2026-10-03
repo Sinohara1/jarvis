@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime
 
-from . import APP_TITLE, APP_VERSION, updater
+from . import APP_TITLE, APP_VERSION, persona, updater
 from .actions import TOOLS
 from .config import (DATA_DIR, PROVIDERS, VOICES, api_key_for, bundle_dir, ensure_dir, normalize_settings)
 from .core import JarvisCore
@@ -129,7 +129,7 @@ class Bridge:
         self._installing = False
         self._tray_hint_shown = False
         self._core = JarvisCore(self._emit)
-        self._tray = Tray(APP_TITLE, on_show=self.show, on_listen=self.listen,
+        self._tray = Tray(persona.assistant_name(self._core.settings), on_show=self.show, on_listen=self.listen,
                           on_focus_stop=self.focus_stop, on_quit=self.quit)
 
     # ───────────────────────── core → JS ─────────────────────────
@@ -142,7 +142,7 @@ class Bridge:
             self._chat.add({"role": "tool", "text": data["label"], "ts": datetime.now().strftime("%H:%M")})
         elif event == "state":
             st = data.get("state", "")
-            self._tray.set_tooltip(f"{APP_TITLE} — " + {"idle": "готов", "listening": "слушаю",
+            self._tray.set_tooltip(f"{self._name()} — " + {"idle": "готов", "listening": "слушаю",
                                                         "thinking": "думаю", "speaking": "говорю"}.get(st, st))
         elif event == "notify":
             if not self._visible:
@@ -216,6 +216,19 @@ class Bridge:
         s.pop("github_token", None)
         return s
 
+    def _name(self) -> str:
+        return persona.assistant_name(self._core.settings)
+
+    def _apply_name(self) -> None:
+        name = self._name()
+        try:
+            if self._window is not None:
+                self._window.set_title(name)
+        except Exception as e:
+            log.info("set_title failed: %s", e)
+        self._tray.set_tooltip(f"{name} — готов")
+        log.info("assistant name: %s", name)
+
     # ───────────────────────── JS API ─────────────────────────
     def init(self) -> dict:
         c = self._core
@@ -232,6 +245,7 @@ class Bridge:
             "state": c.state, "hotkey": hotkey_pretty(s["hotkey"]), "autostart": get_autostart() or s["autostart"],
             "wake": {"enabled": bool(c.wake), "error": None}, "maximized": self._frame.maximized,
             "has_key": bool(api_key_for(s, prov)), "data_dir": DATA_DIR,
+            "presets": persona.presets_payload(),
         }
         self._ready.set()
         log.info("UI connected (js init)")
@@ -277,7 +291,10 @@ class Bridge:
             patch["hotkey"] = hk
         new = normalize_settings(_deep_merge(self._core.settings, patch))
         old_top = self._core.settings.get("always_on_top")
+        old_name = self._name()
         self._core.apply_settings(new)
+        if self._name() != old_name:
+            self._apply_name()
         if "autostart" in patch:
             set_autostart(bool(new["autostart"]))
         if self._window is not None and new.get("always_on_top") != old_top:
@@ -313,8 +330,8 @@ class Bridge:
         if volume is not None:
             tmp["tts_volume"] = int(volume)
         sp.get_settings = lambda: tmp
-        name = self._core.settings.get("user_name") or "Вова"
-        self._core.say(f"Привет, {name}. Я Джарвис. Так звучит мой голос.", interrupt=True)
+        user = str(self._core.settings.get("user_name") or "").strip()
+        self._core.say(f"Привет{', ' + user if user else ''}. Я {self._name()}. Так звучит мой голос.", interrupt=True)
 
         def restore() -> None:
             time.sleep(10)
@@ -477,7 +494,7 @@ class Bridge:
         if hwnd:
             self._frame.attach(hwnd)
         else:
-            self._frame.find(APP_TITLE)
+            self._frame.find(self._name())
         log.info("window shown (hwnd=%s)", self._frame.hwnd)
         self._fix_size()
         threading.Thread(target=self._probe, daemon=True).start()
@@ -542,7 +559,7 @@ def run(start_minimized: bool = False, on_instance=None) -> None:
     hidden = bool(start_minimized and bridge._tray.ok)
     bridge._visible = not hidden
     win = webview.create_window(
-        APP_TITLE, url=os.path.join(WEB_DIR, "index.html"), js_api=bridge,
+        persona.assistant_name(bridge._core.settings), url=os.path.join(WEB_DIR, "index.html"), js_api=bridge,
         width=WIN_W, height=WIN_H, min_size=(MIN_W, MIN_H), frameless=True, easy_drag=False,
         background_color="#161616", hidden=hidden, on_top=bool(bridge._core.settings.get("always_on_top")),
         text_select=False,

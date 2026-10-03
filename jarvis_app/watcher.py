@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import io
 import os
-import random
 import sys
 from dataclasses import dataclass
 
@@ -206,26 +205,7 @@ class NudgePolicy:
         return self.level
 
 
-NUDGES = {
-    1: [
-        "Эй, мы же делаем {task}. Давай вернёмся.",
-        "Кажется, ты отвлёкся. Возвращаемся к задаче: {task}.",
-        "Небольшое напоминание: сейчас время для «{task}».",
-    ],
-    2: [
-        "Вова, это уже второй раз. Закрывай и возвращайся к задаче: {task}.",
-        "Не залипай. Осталось {left}, давай доделаем {task}.",
-        "Я всё вижу. {task} само себя не сделает.",
-    ],
-    3: [
-        "Серьёзно, хватит листать. Закрой это прямо сейчас и вернись к задаче: {task}.",
-        "Стоп. Ты обещал себе {task}. Закрывай ленту, у тебя получится.",
-        "Это уже третий звонок. Убери отвлечение и сделай хотя бы пять минут: {task}.",
-    ],
-}
-
-
 def nudge_text(level: int, task: str, left: str = "", reason: str = "") -> str:
-    lvl = max(1, min(3, int(level)))
-    t = random.choice(NUDGES[lvl])
-    return t.format(task=task or "твоя задача", left=left or "немного")
+    """Neutral nudge (no character). The app uses persona.nudge_text with the chosen character."""
+    from .persona import nudge_text as _nt
+    return _nt({"character_preset": "custom", "user_name": ""}, level, task, left)

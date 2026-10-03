@@ -5,6 +5,10 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 let API = null;
+const NM = () => (S.settings && String(S.settings.assistant_name || '').trim()) || 'Джарвис';
+const isDefaultName = (n) => /^(джарвис|jarvis)$/i.test(String(n).trim());
+const VOICE_RU = { 'ru-RU-DmitryNeural': 'Дмитрий', 'ru-RU-SvetlanaNeural': 'Светлана' };
+const vname = (v) => VOICE_RU[v] || String(v).replace(/^[a-z]{2}-[A-Z]{2}-/, '').replace(/Neural$/, '');
 const S = { settings: {}, providers: {}, voices: [], chat: [], focus: {}, stats: {}, state: 'idle', tab: 'home',
             chatMode: false, attach: false, wake: { enabled: false }, echo: [], hotkey: 'Ctrl+Alt+J' };
 
@@ -53,7 +57,8 @@ async function start() {
   const d = await API.init();
   Object.assign(S, { settings: d.settings, providers: d.providers, voices: d.voices, abilities: d.abilities, tools: d.tools,
                      chat: d.chat || [], focus: d.focus, stats: d.stats, version: d.version, hotkey: d.hotkey,
-                     autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir });
+                     autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir, presets: d.presets || [] });
+  applyName();
   setState(d.state || 'idle');
   setMax(d.maximized);
   renderComposer();
@@ -91,7 +96,7 @@ function onEvent(e, d) {
     case 'window': setMax(d.maximized); break;
     case 'update': toast(`Доступна новая версия ${d.tag}`, '', 0, [['Посмотреть', openVersions]]); break;
     case 'upd_progress': renderUpdProgress(d); break;
-    case 'upd_ready': toast(`Устанавливаю ${d.tag} — Джарвис перезапустится…`, '', 0); closeModal(); break;
+    case 'upd_ready': toast(`Устанавливаю ${d.tag} — ${NM()} перезапустится…`, '', 0); closeModal(); break;
     case 'upd_error': S.installing = null; toast('Не удалось установить: ' + d.error, 'err', 8000); renderVersions(); break;
     case 'reminders': break;
   }
@@ -130,7 +135,7 @@ function msgEl(m) {
   const el = document.createElement('div');
   const role = m.role === 'jarvis' ? 'jarvis' : m.role === 'user' ? 'user' : m.role === 'tool' ? 'tool' : 'system';
   el.className = `msg ${role}${m.kind === 'nudge' ? ' nudge' : ''}`;
-  if (role === 'jarvis') el.innerHTML = `<div class="av">${icon(m.kind === 'nudge' ? 'target' : 'spark', 14)}</div><div class="bubble">${esc(m.text)}</div>`;
+  if (role === 'jarvis') el.innerHTML = `<div class="av">${icon(m.kind === 'nudge' ? 'target' : 'spark', 14)}</div><div class="col"><div class="who">${esc(NM())}</div><div class="bubble">${esc(m.text)}</div></div>`;
   else if (role === 'user') el.innerHTML = `<div class="bubble">${esc(m.text)}</div>`;
   else if (role === 'tool') el.innerHTML = `<span class="toolchip">${icon('zap', 12)}${esc(m.text)}</span>`;
   else el.innerHTML = `<div class="bubble">${esc(m.text)}</div>`;
@@ -206,8 +211,8 @@ function renderComposer() {
 }
 function renderGreeting() {
   const h = new Date().getHours();
-  const name = S.settings.user_name || 'Вова';
-  const g = h >= 1 && h < 5 ? `Не спится, ${name}?` : `Пора работать, ${name}?`;
+  const name = String(S.settings.user_name || '').trim();
+  const g = h >= 1 && h < 5 ? (name ? `Не спится, ${name}?` : 'Не спится?') : (name ? `Пора работать, ${name}?` : 'Пора работать?');
   $('#greet').textContent = S.focus && S.focus.active && S.focus.task ? `Фокус: ${S.focus.task}` : g;
 }
 
@@ -288,7 +293,7 @@ function popWatch(anchor) {
 function popBurger(anchor) {
   const top = !!S.settings.always_on_top;
   const h = pi('top', 'pin', top ? 'Не поверх окон' : 'Поверх всех окон') + pi('tray', 'tray', 'Свернуть в трей') + pi('new', 'edit', 'Новый чат') +
-            pi('data', 'folder', 'Папка данных') + '<div class="sep"></div>' + pi('quit', 'power', 'Выйти из Джарвиса');
+            pi('data', 'folder', 'Папка данных') + '<div class="sep"></div>' + pi('quit', 'power', 'Выйти');
   openPop(anchor, h, 'below', async (v) => {
     if (v === 'top') { await save({ always_on_top: !top }, true); buildPages(); }
     else if (v === 'tray') API.hide();
@@ -300,11 +305,11 @@ function popBurger(anchor) {
 function popGrid(anchor) {
   const f = S.focus || {};
   const h = '<div class="ph-h">Панели</div>' + pi('focus', 'target', 'Фокус и статистика', f.active ? fmt(f.remaining) : '') +
-            pi('cmds', 'terminal', 'Что умеет Джарвис') + pi('cam', 'camera', 'Камера', 'скоро', 'dim') + pi('help', 'keyboard', 'Горячие клавиши', S.hotkey);
+            pi('cmds', 'terminal', `Что умеет ${esc(NM())}`) + pi('cam', 'camera', 'Камера', 'скоро', 'dim') + pi('help', 'keyboard', 'Горячие клавиши', S.hotkey);
   openPop(anchor, h, 'below', (v) => {
     if (v === 'focus') selectTab('focus');
     else if (v === 'cmds') selectTab('commands');
-    else if (v === 'cam') toast('Камера появится в следующих версиях — Джарвис сможет замечать, что ты отвлёкся на телефон.', '', 4000);
+    else if (v === 'cam') toast(`Камера появится в следующих версиях — ${NM()} сможет замечать, что ты отвлёкся на телефон.`, '', 4000);
     else if (v === 'help') toast(`${S.hotkey}: удерживай — говоришь; короткое нажатие — слушаю до паузы; повторное — стоп.`, '', 6000);
   });
 }
@@ -335,7 +340,7 @@ const head = (t, p) => `<div class="ph"><div><h2>${t}</h2>${p ? `<p>${p}</p>` : 
 function buildCommands() {
   const ab = S.abilities || [];
   const cc = S.settings.custom_commands || [];
-  $('#p-commands').innerHTML = head('Команды', 'Скажи или напиши своими словами — Джарвис сам выберет действие. Нажми на карточку, чтобы попробовать.') +
+  $('#p-commands').innerHTML = head('Команды', `Скажи или напиши своими словами — ${esc(NM())} сам выберет действие. Нажми на карточку, чтобы попробовать.`) +
     `<div class="grid2" style="margin-bottom:14px">${ab.map((a, i) => `<div class="card abil" data-try="${i}"><div class="top"><div class="ico">${icon(a.icon, 16)}</div><div class="ttl">${esc(a.title)}</div></div>
       <div class="dsc">${esc(a.desc)}</div><div class="ex">«${esc(a.example)}»</div></div>`).join('')}</div>
     <div class="card sect"><h3>${icon('terminal', 15)}Свои команды<span class="badge">в меню «/»</span></h3>
@@ -343,10 +348,10 @@ function buildCommands() {
         <button class="btn sm ghost" data-run="${i}">${icon('play', 13)}Запустить</button><button class="icon-btn" data-del="${i}" title="Удалить">${icon('trash', 15)}</button></div>`).join('') : '<div class="note" style="margin:0 0 10px">Пока пусто. Например: «утро» → «Открой почту, календарь и скажи, сколько времени».</div>'}</div>
       <div class="grid2" style="grid-template-columns: 1fr 2fr auto; align-items:end; margin-top:10px">
         <div class="field"><label>Название</label><input id="cc-name" class="inp" placeholder="утро"></div>
-        <div class="field"><label>Что сказать Джарвису</label><input id="cc-prompt" class="inp" placeholder="Открой почту и скажи, сколько времени"></div>
+        <div class="field"><label>Что сказать ассистенту</label><input id="cc-prompt" class="inp" placeholder="Открой почту и скажи, сколько времени"></div>
         <button id="cc-add" class="btn primary">${icon('plus', 15)}Добавить</button>
       </div></div>
-    <div class="card sect"><h3>${icon('shield', 15)}Безопасность</h3><div class="note" style="margin:0">Джарвис не удаляет файлы, не закрывает программы и не отправляет сообщения. Скрипты и установщики он не запускает. Включи «Подтверждать опасные действия», чтобы он спрашивал перед открытием программ и сайтов.</div></div>`;
+    <div class="card sect"><h3>${icon('shield', 15)}Безопасность</h3><div class="note" style="margin:0">${esc(NM())} не удаляет файлы, не закрывает программы и не отправляет сообщения. Скрипты и установщики он не запускает. Включи «Подтверждать опасные действия», чтобы он спрашивал перед открытием программ и сайтов.</div></div>`;
   $$('#p-commands [data-try]').forEach((el) => el.onclick = () => { const a = ab[+el.dataset.try]; selectTab('home'); $('#input').value = a.example; $('#input').focus(); });
   $$('#p-commands [data-run]').forEach((el) => el.onclick = () => send(cc[+el.dataset.run].prompt));
   $$('#p-commands [data-del]').forEach((el) => el.onclick = async () => { const list = cc.filter((_, i) => i !== +el.dataset.del); await save({ custom_commands: list }); buildCommands(); });
@@ -360,7 +365,7 @@ function buildCommands() {
 function buildModel() {
   const s = S.settings, p = s.provider, info = S.providers[p];
   const m = s.models[p];
-  $('#p-model').innerHTML = head('Модель', 'Какой ИИ думает за Джарвиса. Можно переключиться в любой момент.') +
+  $('#p-model').innerHTML = head('Модель', 'Какой ИИ думает за ассистента. Можно переключиться в любой момент.') +
     `<div class="card sect"><h3>${icon('box', 15)}Провайдер</h3>
       <div class="seg" id="prov-seg">${Object.entries(S.providers).map(([k, v]) => `<button data-p="${k}" class="${k === p ? 'on' : ''}">${esc(v.label)}</button>`).join('')}</div>
       <div class="grid2" style="margin-top:16px">
@@ -372,7 +377,7 @@ function buildModel() {
       <details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Дополнительно: адрес API</summary>
         <div class="field" style="margin-top:8px"><input id="m-base" class="inp" value="${esc(s.base_urls[p] || info.base_url)}"></div></details>
       <div class="row" style="margin-top:12px;border:0"><button id="m-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="m-test" class="btn">${icon('zap', 15)}Проверить</button><span id="m-res" class="result"></span></div>
-      <div class="note">Бесплатный Gemini: около 10 запросов в минуту и ограничение в день. При лимите Джарвис скажет об этом, временно перейдёт на лёгкую модель и реже проверяет экран. <b>gemini-2.5-flash</b> недоступна для новых ключей — по умолчанию <b>gemini-3.5-flash</b>.</div></div>`;
+      <div class="note">Бесплатный Gemini: около 10 запросов в минуту и ограничение в день. При лимите ${esc(NM())} скажет об этом, временно перейдёт на лёгкую модель и реже проверяет экран. <b>gemini-2.5-flash</b> недоступна для новых ключей — по умолчанию <b>gemini-3.5-flash</b>.</div></div>`;
   $$('#prov-seg button').forEach((b) => b.onclick = async () => { await save({ provider: b.dataset.p }, true); buildModel(); renderComposer(); toast('Провайдер: ' + S.providers[b.dataset.p].label, '', 1500); });
   $('#key-link').onclick = () => API.open_link(info.key_url);
   $('#key-eye').onclick = () => { const k = $('#m-key'); k.type = k.type === 'password' ? 'text' : 'password'; };
@@ -383,8 +388,8 @@ function buildModel() {
 
 function buildVoice() {
   const s = S.settings;
-  $('#p-voice').innerHTML = head('Голос', 'Как Джарвис слушает и говорит.') +
-    `<div class="card sect"><h3>${icon('vol', 15)}Голос Джарвиса</h3>
+  $('#p-voice').innerHTML = head('Голос', `Как ${esc(NM())} слушает и говорит.`) +
+    `<div class="card sect"><h3>${icon('vol', 15)}Голос ассистента</h3>
       <div class="grid2"><div class="field"><label>Голос (Microsoft Edge, бесплатно)</label><select id="v-voice" class="inp">${S.voices.map((v) => `<option ${v === s.voice ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
       <div class="field"><label>&nbsp;</label><button id="v-test" class="btn">${icon('play', 14)}Проверить голос</button></div></div>
       <div class="row" style="margin-top:8px"><div class="grow"><div class="t">Скорость речи</div></div><input id="v-rate" class="slider" style="max-width:300px" type="range" min="-50" max="50" value="${s.tts_rate}"><span class="val" id="v-rate-v">${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</span></div>
@@ -430,15 +435,36 @@ async function toggleWake() {
   if (r && r.ok) { S.settings = r.settings; S.wake = r.wake; renderComposer(); toast(S.wake.enabled ? 'Скажи «Hey Jarvis», чтобы позвать меня' : 'Слово-активатор выключено', '', 2200); }
 }
 
+function applyName() {
+  const n = NM();
+  const wm = $('#wordmark .wm');
+  if (wm) { wm.textContent = isDefaultName(n) ? 'Jarvis' : n; $('#wordmark').classList.toggle('long', n.length > 9); $('#wordmark').classList.toggle('xlong', n.length > 14); }
+  document.title = n;
+  const t = $('#wake-btn'); if (t) t.title = 'Слово-активатор «Hey Jarvis» (не зависит от имени ассистента)';
+  $$('#msgs .msg.jarvis .who').forEach((el) => { el.textContent = n; });
+}
+function presetOf(key) { return (S.presets || []).find((p) => p.key === key); }
 function buildAI() {
   const s = S.settings;
   const opts = [[0, 'Выключено'], [30, 'Каждые 30 с'], [60, 'Каждую минуту'], [90, 'Каждые 90 с'], [180, 'Каждые 3 мин'], [300, 'Каждые 5 мин']];
   if (!opts.some((o) => o[0] === s.screen_check_sec)) opts.push([s.screen_check_sec, `Каждые ${s.screen_check_sec} с`]);
-  $('#p-ai').innerHTML = head('ИИ', 'Характер Джарвиса и то, как он следит за фокусом.') +
-    `<div class="card sect"><h3>${icon('user', 15)}Характер</h3>
-      <div class="grid2"><div class="field"><label>Как к тебе обращаться</label><input id="a-name" class="inp" value="${esc(s.user_name)}"></div><div></div></div>
-      <div class="field" style="margin-top:12px"><label>Дополнительные инструкции (что важно знать Джарвису о тебе, стиль общения)</label>
-        <textarea id="a-persona" class="inp" placeholder="Например: я учусь в 10 классе, готовлюсь к ЕГЭ. Будь построже, когда я отвлекаюсь. Шути иногда.">${esc(s.persona)}</textarea></div>
+  const pk = s.character_preset || 'butler';
+  const pr = presetOf(pk);
+  const charText = String(s.character || '').trim() || (pr ? pr.prompt : '');
+  const sugg = pr && (pr.voice !== s.voice || pr.rate !== s.tts_rate) ? pr : null;
+  $('#p-ai').innerHTML = head('ИИ', 'Имя и характер ассистента, и то, как он следит за фокусом.') +
+    `<div class="card sect"><h3>${icon('spark', 15)}Имя</h3>
+      <div class="grid2"><div class="field"><label>Как зовут ассистента</label><input id="a-aname" class="inp" maxlength="30" placeholder="Джарвис" value="${esc(s.assistant_name || 'Джарвис')}"></div>
+        <div class="field"><label>Как ассистенту обращаться к тебе</label><input id="a-name" class="inp" maxlength="40" placeholder="Имя (необязательно)" value="${esc(s.user_name)}"></div></div>
+      <div class="note">Имя видно в окне, трее и чате, и так ассистент называет себя в ответах. Слово-активатор не меняется: чтобы позвать голосом, всё так же говори <b>«Hey Jarvis»</b>.</div></div>
+    <div class="card sect"><h3>${icon('user', 15)}Характер</h3>
+      <div class="pchips">${(S.presets || []).map((p) => `<button class="pchip${p.key === pk ? ' on' : ''}" data-preset="${p.key}">${esc(p.label)}</button>`).join('')}<button class="pchip${pk === 'custom' ? ' on' : ''}" data-preset="custom">${icon('edit', 12)}Свой</button></div>
+      <div class="field" style="margin-top:12px"><label>Характер — как ассистент говорит и ведёт себя (можно переписать своими словами)</label>
+        <textarea id="a-char" class="inp" rows="3" maxlength="2000" placeholder="Например: весёлый пират, говорит «йо-хо-хо», но помогает с домашкой">${esc(charText)}</textarea></div>
+      ${sugg ? `<div class="row vsug"><div class="grow"><div class="t">Голос под характер: ${esc(vname(sugg.voice))}, скорость ${sugg.rate > 0 ? '+' : ''}${sugg.rate}%</div><div class="s">Сейчас: ${esc(vname(s.voice))}, ${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</div></div>
+        <button id="a-vtry" class="btn ghost sm">${icon('play', 13)}Послушать</button><button id="a-vapply" class="btn sm">${icon('check', 13)}Применить</button></div>` : ''}
+      <div class="field" style="margin-top:12px"><label>Дополнительные пожелания (что важно знать о тебе, о чём помнить)</label>
+        <textarea id="a-persona" class="inp" placeholder="Например: я учусь в 10 классе, готовлюсь к ЕГЭ. Шути иногда.">${esc(s.persona)}</textarea></div>
       <div class="row" style="margin-top:6px"><div class="grow"><div class="t">Подтверждать опасные действия</div><div class="s">Спрашивать перед открытием программ, файлов и сайтов</div></div>${tgl('a-confirm', s.confirm_actions)}</div>
       <div class="row"><button id="a-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="a-reset" class="btn ghost">${icon('refresh', 14)}Новый чат — очистить память разговора</button></div></div>
     <div class="card sect"><h3>${icon('shield', 15)}Страж фокуса</h3>
@@ -448,14 +474,38 @@ function buildAI() {
         <div class="field"><label>Пауза между напоминаниями, с</label><input id="a-cool" class="inp" type="number" min="15" max="900" value="${s.nudge_cooldown_sec}"></div>
         <div class="field"><label>Сколько можно «подсмотреть» без замечания, с</label><input id="a-grace" class="inp" type="number" min="0" max="120" value="${s.distraction_grace_sec}"></div>
       </div>
-      <div class="note">Скриншот уменьшается и уходит только в лёгкую модель вместе с твоей задачей; на диск ничего не сохраняется. Заголовки окон проверяются локально, без ИИ.</div></div>`;
+      <div class="note">Напоминания звучат в выбранном характере. Скриншот уменьшается и уходит только в лёгкую модель вместе с твоей задачей; на диск ничего не сохраняется. Заголовки окон проверяются локально, без ИИ.</div></div>`;
+  $$('#p-ai [data-preset]').forEach((b) => { b.onclick = () => pickPreset(b.dataset.preset); });
+  $('#a-aname').onchange = () => saveName();
+  $('#a-aname').onkeydown = (e) => { if (e.key === 'Enter') e.target.blur(); };
+  if (sugg) {
+    $('#a-vtry').onclick = () => API.test_voice(sugg.voice, sugg.rate, s.tts_volume);
+    $('#a-vapply').onclick = async () => { if (await save({ voice: sugg.voice, tts_rate: sugg.rate }, true)) { toast(`Голос: ${vname(sugg.voice)}`, '', 1800); buildAI(); buildVoice(); } };
+  }
   $('#a-confirm').onclick = async () => { await save({ confirm_actions: !S.settings.confirm_actions }, true); buildAI(); };
-  $('#a-save').onclick = async () => { await save({ user_name: $('#a-name').value.trim(), persona: $('#a-persona').value }); renderGreeting(); };
+  $('#a-save').onclick = async () => {
+    const txt = $('#a-char').value.trim(); const cur = presetOf(S.settings.character_preset);
+    const patch = { user_name: $('#a-name').value.trim(), persona: $('#a-persona').value, assistant_name: $('#a-aname').value.trim() || 'Джарвис' };
+    if (cur && txt === cur.prompt) Object.assign(patch, { character: '' });
+    else Object.assign(patch, { character_preset: txt ? 'custom' : (S.settings.character_preset === 'custom' ? 'butler' : S.settings.character_preset), character: txt });
+    if (await save(patch)) { nameChanged(); buildAI(); }
+  };
   $('#a-reset').onclick = () => newChat();
   $('#a-screen').onchange = () => save({ screen_check_sec: +$('#a-screen').value });
   $('#a-title').onchange = () => save({ title_check_sec: +$('#a-title').value });
   $('#a-cool').onchange = () => save({ nudge_cooldown_sec: +$('#a-cool').value });
   $('#a-grace').onchange = () => save({ distraction_grace_sec: +$('#a-grace').value });
+}
+async function saveName() {
+  const n = $('#a-aname').value.trim() || 'Джарвис';
+  if (n === NM()) return;
+  if (await save({ assistant_name: n }, true)) { nameChanged(); toast(`Теперь меня зовут ${n}`, '', 2000); }
+}
+function nameChanged() { applyName(); renderGreeting(); buildCommands(); buildModel(); buildVoice(); buildFocus(); buildSettings(); }
+async function pickPreset(key) {
+  if (key === 'custom') { const t = $('#a-char'); t.focus(); t.select(); toast('Опиши характер своими словами и нажми «Сохранить»', '', 2600); return; }
+  const p = presetOf(key); if (!p) return;
+  if (await save({ character_preset: key, character: '' }, true)) { buildAI(); toast(`Характер: ${p.label}`, '', 1600); }
 }
 
 const RING_C = 2 * Math.PI * 92;
@@ -478,7 +528,7 @@ function buildFocus() {
     <div class="card sect"><h3>${icon('eyeoff', 15)}Отвлечения</h3>
       <div class="chips" id="f-dl">${(s.distractions || []).map((d, i) => `<span class="tag">${esc(d)}<button data-rm="${i}">${icon('x', 12)}</button></span>`).join('')}</div>
       <div class="row" style="margin-top:10px;border:0"><input id="f-dadd" class="inp" style="max-width:320px" placeholder="слово из заголовка окна или proc:имя.exe"><button id="f-dbtn" class="btn">${icon('plus', 14)}Добавить</button></div>
-      <div class="note">Если в заголовке активного окна есть одно из этих слов во время фокуса — Джарвис мягко вернёт тебя к задаче. <b>proc:discord.exe</b> — по имени программы.</div></div>`;
+      <div class="note">Если в заголовке активного окна есть одно из этих слов во время фокуса — ${esc(NM())} мягко вернёт тебя к задаче. <b>proc:discord.exe</b> — по имени программы.</div></div>`;
   $('#f-dbtn').onclick = addDistraction;
   $('#f-dadd').onkeydown = (e) => { if (e.key === 'Enter') addDistraction(); };
   $$('#f-dl [data-rm]').forEach((b) => b.onclick = async () => { const l = S.settings.distractions.filter((_, i) => i !== +b.dataset.rm); await save({ distractions: l }, true); buildFocus(); });
@@ -528,7 +578,7 @@ function renderStats() {
 
 function buildSettings() {
   const s = S.settings;
-  $('#p-settings').innerHTML = head('Настройки', `Джарвис ${esc(S.version)}`) +
+  $('#p-settings').innerHTML = head('Настройки', `${esc(NM())} ${esc(S.version)}`) +
     `<div class="card sect" id="s-vers"><h3>${icon('download', 15)}Версии<span class="grow"></span><button id="s-vref" class="icon-btn" title="Обновить список">${icon('refresh', 14)}</button></h3>
       <div class="row"><div class="grow"><div class="t">Установлена <b>v${esc(S.version)}</b></div><div class="s">Можно обновиться или откатиться на любую версию. Настройки, ключ и история сохраняются.</div></div>
         <button id="s-repo" class="btn ghost sm">${icon('github', 14)}GitHub</button></div>
@@ -536,11 +586,11 @@ function buildSettings() {
     <div class="card sect"><h3>${icon('app', 15)}Окно и запуск</h3>
       <div class="row"><div class="grow"><div class="t">Запускать вместе с Windows</div><div class="s">Стартует свёрнутым в трей</div></div>${tgl('s-auto', S.autostart)}</div>
       <div class="row"><div class="grow"><div class="t">Поверх всех окон</div></div>${tgl('s-top', s.always_on_top)}</div>
-      <div class="row"><div class="grow"><div class="t">Крестик сворачивает в трей</div><div class="s">Джарвис продолжает слушать горячую клавишу и следить за фокусом</div></div>${tgl('s-tray', s.close_to_tray)}</div></div>
+      <div class="row"><div class="grow"><div class="t">Крестик сворачивает в трей</div><div class="s">${esc(NM())} продолжает слушать горячую клавишу и следить за фокусом</div></div>${tgl('s-tray', s.close_to_tray)}</div></div>
     <div class="card sect"><h3>${icon('folder', 15)}Данные</h3>
       <div class="row"><div class="grow"><div class="t">Настройки, ключи, статистика и журнал</div><div class="s">${esc(S.dataDir || '%LOCALAPPDATA%\\Jarvis')}</div></div><button id="s-data" class="btn">${icon('folder', 14)}Открыть папку</button></div></div>
     <div class="card sect"><div class="soon"><div class="big">${icon('camera', 22)}</div><div class="grow"><div class="t" style="font-weight:700">Камера<span class="badge">скоро</span></div>
-      <div class="s">Джарвис сможет замечать, что ты взял телефон или ушёл от компьютера.</div></div></div></div>`;
+      <div class="s">${esc(NM())} сможет замечать, что ты взял телефон или ушёл от компьютера.</div></div></div></div>`;
   $('#s-auto').onclick = async () => { const on = !S.autostart; if (await save({ autostart: on }, true)) { S.autostart = on; buildSettings(); } };
   $('#s-top').onclick = async () => { await save({ always_on_top: !S.settings.always_on_top }, true); buildSettings(); };
   $('#s-tray').onclick = async () => { await save({ close_to_tray: !S.settings.close_to_tray }, true); buildSettings(); };
@@ -585,7 +635,7 @@ function confirmInstall(tag) {
   const r = S.versions || {}; const v = (r.releases || []).find((x) => x.tag === tag); if (!v) return;
   const newer = v.status === 'newer';
   openModal(newer ? `Обновить до ${v.tag}?` : `Откатить на ${v.tag}?`,
-    `Сейчас установлена v${esc(S.version)}. Джарвис скачает ${esc(v.tag)} с GitHub${v.size ? ` (${(v.size / 1048576).toFixed(1)} МБ)` : ''}, закроется и запустится уже в новой версии.<br><br>Настройки, API-ключ, история чата и статистика сохранятся. Вернуться обратно можно здесь же в любой момент.`,
+    `Сейчас установлена v${esc(S.version)}. ${esc(NM())} скачает ${esc(v.tag)} с GitHub${v.size ? ` (${(v.size / 1048576).toFixed(1)} МБ)` : ''}, закроется и запустится уже в новой версии.<br><br>Настройки, API-ключ, история чата и статистика сохранятся. Вернуться обратно можно здесь же в любой момент.`,
     newer ? 'Обновить' : 'Откатить', () => doInstall(tag));
 }
 async function doInstall(tag) {

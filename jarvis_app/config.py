@@ -158,7 +158,10 @@ DEFAULT_SETTINGS: dict = {
     "persona": "",
     "confirm_actions": False,
     "custom_commands": [],   # [{"name": str, "prompt": str}]
-    "user_name": "Вова",
+    "user_name": "",
+    "assistant_name": "Джарвис",
+    "character_preset": "butler",  # key from persona.PRESETS or "custom"
+    "character": "",               # free text; empty = preset text
 }
 
 
@@ -219,7 +222,10 @@ def normalize_settings(raw: dict) -> dict:
     for b in ("speak_replies", "wake_word", "autostart", "always_on_top", "close_to_tray", "confirm_actions"):
         s[b] = bool(s.get(b))
     s["persona"] = str(s.get("persona") or "")[:4000]
-    s["user_name"] = str(s.get("user_name") or "Вова").strip()[:40] or "Вова"
+    s["user_name"] = str(s.get("user_name") or "").strip()[:40]
+    s["assistant_name"] = str(s.get("assistant_name") or "").strip()[:30] or "Джарвис"
+    s["character_preset"] = str(s.get("character_preset") or "butler").strip()[:30] or "butler"
+    s["character"] = str(s.get("character") or "")[:2000]
     cc = s.get("custom_commands")
     out = []
     if isinstance(cc, list):

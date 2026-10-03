@@ -55,10 +55,10 @@ class Tray:
             self.ok = False
         return self.ok
 
-    def notify(self, text: str, title: str = "Джарвис") -> None:
+    def notify(self, text: str, title: str | None = None) -> None:
         if self.icon is not None:
             try:
-                self.icon.notify(text[:200], title)
+                self.icon.notify(text[:200], title or self.title)
             except Exception:
                 pass
 
@@ -66,6 +66,7 @@ class Tray:
         if self.icon is not None:
             try:
                 self.icon.title = text[:120]
+                self.title = text[:120]
             except Exception:
                 pass
 

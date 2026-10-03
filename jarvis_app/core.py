@@ -15,6 +15,7 @@ from . import providers as P
 from .actions import Actions
 from .audio import MicHub, Recording, Speaker, beep
 from .brain import Brain, context_line
+from . import persona
 from .config import load_settings, normalize_settings, register_secrets, save_settings
 from .focus import FocusSession, Stats, fmt_clock, minutes_phrase
 from .hotkey import Hotkey
@@ -475,7 +476,7 @@ class JarvisCore:
         if self.state in ("listening", "thinking"):
             return
         left = minutes_phrase(max(1, int(self.session.remaining() // 60)))
-        text = nudge_text(level, self.session.task, left=left)
+        text = persona.nudge_text(self.settings, level, self.session.task, left=left)
         log.info("nudge level %d", level)
         beep("nudge")
         self.emit("chat", role="jarvis", text=text, kind="nudge")

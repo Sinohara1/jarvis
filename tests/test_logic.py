@@ -196,6 +196,26 @@ def test_old_version_tolerates_new_keys():
     assert s["future_key"] == [1, 2] and s["assistant_name"] == "Пятница"
 
 
+def test_persona_and_prompt():
+    from jarvis_app import persona
+    from jarvis_app.brain import build_system_prompt
+    s = normalize_settings({})
+    assert s["assistant_name"] == "Джарвис" and s["character_preset"] == "butler" and s["user_name"] == ""
+    p = build_system_prompt(s)
+    assert "Ты — Джарвис" in p and persona.PRESETS["butler"]["prompt"] in p and "Вов" not in p
+    s2 = normalize_settings({"assistant_name": "Пятница", "character_preset": "coach", "user_name": "Вова"})
+    p2 = build_system_prompt(s2)
+    assert "Ты — Пятница" in p2 and "Строгий" in p2 and "Вова" in p2
+    s3 = normalize_settings({"character_preset": "custom", "character": "Пират {арр}"})
+    assert "Пират {арр}" in build_system_prompt(s3)
+    for k in persona.PRESETS:
+        t = persona.nudge_text({"character_preset": k, "user_name": "Вова"}, 2, "физика", "10 минут")
+        assert "{" not in t and t
+    t = persona.nudge_text({"character_preset": "custom", "user_name": ""}, 2, "физика", "10 минут")
+    assert t in [x.format(task="физика", left="10 минут", user="").replace(", ", ", ") for x in persona.NEUTRAL_NUDGES[2]] or "{" not in t
+    assert persona.assistant_name({"assistant_name": "  "}) == "Джарвис"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:

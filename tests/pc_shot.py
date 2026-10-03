@@ -1,5 +1,5 @@
 """Capture the Jarvis window even if it is covered (PrintWindow + PW_RENDERFULLCONTENT).
-usage: python pc_shot.py out.png"""
+usage: python pc_shot.py out.png [window title]"""
 import ctypes, sys
 from ctypes import wintypes as W
 from PIL import Image
@@ -8,7 +8,7 @@ try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     pass
-hwnd = u.FindWindowW(None, "Джарвис")
+hwnd = u.FindWindowW(None, sys.argv[2] if len(sys.argv) > 2 else "Джарвис")
 if not hwnd:
     print("window not found"); sys.exit(1)
 r = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
