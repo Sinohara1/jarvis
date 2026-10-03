@@ -381,7 +381,7 @@ class Bridge:
             import webbrowser
             webbrowser.open(url)
 
-    # versions (GitHub Releases of Sinohara1/jarvis)
+    # versions (GitHub Releases of Sinohara1/jarvis-releases)
     def list_versions(self, force: bool = False) -> dict:
         try:
             rels = updater.list_releases(force=bool(force))

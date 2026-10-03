@@ -601,7 +601,7 @@ function buildSettings() {
   $('#s-tray').onclick = async () => { await save({ close_to_tray: !S.settings.close_to_tray }, true); buildSettings(); };
   $('#s-data').onclick = () => API.open_data_folder();
   $('#s-vref').onclick = () => loadVersions(true);
-  $('#s-repo').onclick = () => API.open_link(S.repo || 'https://github.com/Sinohara1/jarvis/releases');
+  $('#s-repo').onclick = () => API.open_link(S.repo || 'https://github.com/Sinohara1/jarvis-releases/releases');
   if (S.versions) renderVersions(); else loadVersions(false);
 }
 
