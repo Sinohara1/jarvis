@@ -71,6 +71,11 @@ async function start() {
 window.J = {
   autotest(cmd) {   // set only via JARVIS_AUTOTEST for automated screenshots
     if (cmd.startsWith('tab:')) { selectTab(cmd.slice(4)); return; }
+    if (cmd.startsWith('type:')) {   // type:sel=value — set an input and fire change (test hook)
+      const i = cmd.indexOf('='); const el = document.querySelector(cmd.slice(5, i));
+      if (el) { el.value = cmd.slice(i + 1); el.dispatchEvent(new Event('change', { bubbles: true })); }
+      API.log_js('autotest type ' + cmd.slice(5, i) + (el ? '' : ' — not found')); return;
+    }
     if (cmd.startsWith('click:')) {   // click:sel1|sel2|… — clicks in order, waiting up to 15 s for each element
       const sels = cmd.slice(6).split('|');
       (async () => { for (const sel of sels) { let el = null; for (let i = 0; i < 150 && !el; i++) { el = document.querySelector(sel); if (!el) await new Promise((r) => setTimeout(r, 100)); }

@@ -253,7 +253,9 @@ class Bridge:
         if auto:  # dev/test hook: drive the real UI path (set only by the test launcher)
             def go() -> None:
                 time.sleep(2.5)
-                self._window.evaluate_js(f"J.autotest({json.dumps(auto, ensure_ascii=False)})")
+                for cmd in auto.split(";;"):  # several steps: "tab:ai;;type:#a-aname=Пятница"
+                    self._window.evaluate_js(f"J.autotest({json.dumps(cmd, ensure_ascii=False)})")
+                    time.sleep(2.0)
             threading.Thread(target=go, daemon=True).start()
         return data
 
