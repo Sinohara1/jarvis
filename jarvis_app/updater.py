@@ -9,6 +9,7 @@ to exit, replaces Jarvis.exe and starts it again. User data in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -101,7 +102,7 @@ def list_releases(force: bool = False, current: str = APP_VERSION) -> list[dict]
         out.append({
             "tag": tag, "version": tag.lstrip("vV"), "name": rel.get("name") or tag, "date": date,
             "notes": _short_notes(rel.get("body") or ""), "url": asset.get("browser_download_url"),
-            "size": int(asset.get("size") or 0), "prerelease": bool(rel.get("prerelease")),
+            "size": int(asset.get("size") or 0), "digest": str(asset.get("digest") or ""), "prerelease": bool(rel.get("prerelease")),
             "status": "current" if c == 0 else ("newer" if c > 0 else "older"), "page": rel.get("html_url"),
         })
     out.sort(key=lambda r: parse_semver(r["tag"]) or (0, 0, 0), reverse=True)
@@ -128,6 +129,7 @@ def download(release: dict, on_progress=None) -> str:
     total = int(release.get("size") or 0)
     done = 0
     last = 0.0
+    sha = hashlib.sha256()
     with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
         total = total or int(r.headers.get("Content-Length") or 0)
         while True:
@@ -135,33 +137,67 @@ def download(release: dict, on_progress=None) -> str:
             if not chunk:
                 break
             f.write(chunk)
+            sha.update(chunk)
             done += len(chunk)
             if on_progress and (time.monotonic() - last > 0.15 or done == total):
                 last = time.monotonic()
                 on_progress(done, total)
     if total and done != total:
         raise RuntimeError(f"файл скачался не полностью ({done} из {total} байт)")
+    digest = str(release.get("digest") or "")
+    if digest.startswith("sha256:") and digest[7:].lower() != sha.hexdigest():
+        raise RuntimeError("контрольная сумма не совпала — файл повреждён, попробуй ещё раз")
     with open(path, "rb") as f:
         if f.read(2) != b"MZ":
             raise RuntimeError("скачанный файл не похож на программу")
     return path
 
 
-def write_swap_bat(new_exe: str, target: str, pids: list[int]) -> str:
-    """Batch file: wait (max ~40 s) for our processes to exit, replace target, start it, delete itself."""
+# PyInstaller onefile passes these to its child process. If they leak into the relaunched exe, its
+# bootloader thinks it is that child and loads python3xx.dll from the OLD _MEI folder, which the old
+# process has just deleted → "Failed to load Python DLL …\_MEIxxxx\python313.dll".
+_PYI_ENV_PREFIXES = ("_PYI_", "_MEIPASS", "JARVIS_")
+
+
+def clean_env() -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(_PYI_ENV_PREFIXES)}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # PyInstaller ≥ 6.9: start as an independent instance
+    return env
+
+
+def write_swap_bat(new_exe: str, target: str, pids: list[int], args: list[str] | None = None,
+                   log_path: str | None = None) -> str:
+    """Batch file: wait (max ~40 s) for our processes to exit, replace target (retry while locked),
+    verify the size, start it only after a successful copy, delete itself. Steps go to update.log."""
     bat = os.path.join(os.path.dirname(new_exe), "jarvis_swap.bat")
+    size = os.path.getsize(new_exe) if os.path.exists(new_exe) else 0
+    log = log_path or os.path.join(os.path.dirname(new_exe), "update.log")
+    L = f' >>"{log}" 2>&1'
     checks = "".join(f'tasklist /FI "PID eq {p}" 2>nul | find " {p} " >nul && set alive=1\r\n' for p in pids)
-    kills = "".join(f"taskkill /F /PID {p} >nul 2>&1\r\n" for p in pids)
+    kills = "".join(f"  taskkill /F /PID {p} >nul 2>&1\r\n" for p in pids)
+    argstr = " ".join(f'"{a}"' for a in (args or []))
     content = (
-        "@echo off\r\nchcp 65001 >nul\r\nsetlocal EnableDelayedExpansion\r\nset n=0\r\n"
-        ":wait\r\nset alive=0\r\n" + checks +
+        "@echo off\r\nchcp 65001 >nul\r\nsetlocal EnableDelayedExpansion\r\n"
+        "set PYINSTALLER_RESET_ENVIRONMENT=1\r\nset _PYI_APPLICATION_HOME_DIR=\r\nset _PYI_ARCHIVE_FILE=\r\n"
+        "set _PYI_PARENT_PROCESS_LEVEL=\r\nset _PYI_SPLASH_IPC=\r\nset _MEIPASS2=\r\n"
+        f"echo [%date% %time%] swap start: {target}{L}\r\n"
+        "set n=0\r\n:wait\r\nset alive=0\r\n" + checks +
         "if !alive!==1 (\r\n  set /a n+=1\r\n  if !n! lss 40 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto wait\r\n  )\r\n"
-        + "".join("  " + k for k in kills.splitlines(True)) +
-        "  ping -n 2 127.0.0.1 >nul\r\n)\r\n"
+        f"  echo [%time%] old process did not exit, killing{L}\r\n" + kills +
+        "  ping -n 3 127.0.0.1 >nul\r\n)\r\n"
+        f"echo [%time%] old process exited{L}\r\n"
         "set c=0\r\n:copy\r\n"
-        f'copy /Y "{new_exe}" "{target}" >nul 2>&1\r\n'
-        "if errorlevel 1 (\r\n  set /a c+=1\r\n  if !c! lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto copy\r\n  )\r\n)\r\n"
-        f'start "" "{target}"\r\n'
+        f'copy /Y /B "{new_exe}" "{target}" >nul 2>&1\r\n'
+        "if errorlevel 1 (\r\n  set /a c+=1\r\n  if !c! lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto copy\r\n  )\r\n"
+        f"  echo [%time%] copy FAILED, starting the old version{L}\r\n  goto run\r\n)\r\n"
+        f'for %%A in ("{target}") do set sz=%%~zA\r\n'
+        f"if not \"!sz!\"==\"{size}\" (\r\n  echo [%time%] size mismatch !sz! vs {size}, retrying{L}\r\n"
+        "  set /a c+=1\r\n  if !c! lss 30 (\r\n    ping -n 2 127.0.0.1 >nul\r\n    goto copy\r\n  )\r\n)\r\n"
+        f"echo [%time%] copied OK (!sz! bytes){L}\r\n"
+        ":run\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        f'start "" "{target}" {argstr}\r\n'
+        f"echo [%time%] started{L}\r\n"
         f'del /F /Q "{new_exe}" >nul 2>&1\r\n'
         '(goto) 2>nul & del /F /Q "%~f0"\r\n'
     )
@@ -191,8 +227,7 @@ def _process_image(pid: int) -> str:
 def launch_swap(bat: str) -> None:
     # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP — survives our exit, no console flash
     flags = (0x08000000 | 0x00000200) if sys.platform == "win32" else 0
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("JARVIS_")}  # no test hooks in the new exe
-    subprocess.Popen(["cmd.exe", "/c", bat], cwd=os.path.dirname(bat), creationflags=flags, close_fds=True, env=env)
+    subprocess.Popen(["cmd.exe", "/c", bat], cwd=os.path.dirname(bat), creationflags=flags, close_fds=True, env=clean_env())
 
 
 def install(release: dict, on_progress=None) -> str:
@@ -210,7 +245,14 @@ def install(release: dict, on_progress=None) -> str:
             pids.append(ppid)
     except Exception:
         pass
-    bat = write_swap_bat(new_exe, target, pids)
+    try:
+        from .config import DATA_DIR, ensure_dir
+        ensure_dir(DATA_DIR)
+        log_path = os.path.join(DATA_DIR, "update.log")
+    except Exception:
+        log_path = None
+    args = [a for a in sys.argv[1:] if a == "--minimized"]  # relaunch the same way (tray or window)
+    bat = write_swap_bat(new_exe, target, pids, args, log_path)
     launch_swap(bat)
     log.info("version switch scheduled: %s -> %s (%s)", APP_VERSION, release.get("tag"), target)
     return bat
