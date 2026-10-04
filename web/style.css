@@ -93,7 +93,7 @@ body[data-state="listening"] #wordmark .spark { animation: pulse .7s ease-in-out
 body[data-state="listening"] #mic { color: #111; background: #fff;
   box-shadow: 0 0 0 calc(3px + var(--lvl) * 9px) rgba(255,255,255,.18), 0 0 22px rgba(255,255,255,.55); }
 body[data-state="speaking"] #mic { color: #fff; }
-.crow2 { padding: 4px 4px 0 6px; gap: 14px; min-width: 0; font-size: 12.5px; color: #c3c3c3; height: 34px; }
+.crow2 { padding: 4px 4px 0 6px; gap: 11px; min-width: 0; font-size: 12.5px; color: #c3c3c3; height: 34px; }
 .crow2 .lbl { white-space: nowrap; }
 .toggle { position: relative; width: 34px; height: 19px; border-radius: 12px; background: rgba(0,0,0,.35); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); flex: none; transition: background .2s; }
 .toggle::after { content: ''; position: absolute; left: 2px; top: 2px; width: 15px; height: 15px; border-radius: 50%; background: #f4f4f4; transition: transform .2s ease; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
@@ -104,7 +104,7 @@ body[data-state="speaking"] #mic { color: #fff; }
 .chip:hover { color: #fff; }
 .chip.on { color: #fff; }
 .chip.on .ic { filter: drop-shadow(0 0 5px rgba(255,255,255,.6)); }
-#model-btn { color: #ececec; font-weight: 700; max-width: 150px; min-width: 0; flex: 0 1 auto; }
+#model-btn { color: #ececec; font-weight: 700; max-width: 160px; min-width: 0; flex: 0 1 auto; }
 #model-btn .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #watch-btn { margin-left: auto; border: 1px solid rgba(255,255,255,.28); background: rgba(255,255,255,.08); padding: 4px 9px; border-radius: 9px; color: #e2e2e2; max-width: 150px; min-width: 0; flex: 0 1 auto; }
 #watch-btn .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -138,6 +138,8 @@ body.chatmode #quick { opacity: 0; pointer-events: none; }
 .msg.jarvis .bubble { background: rgba(20,20,20,.46); border: 1px solid var(--edge); border-top-left-radius: 6px; }
 .msg.user { justify-content: flex-end; }
 .msg.user .bubble { background: rgba(255,255,255,.13); border: 1px solid rgba(255,255,255,.10); border-top-right-radius: 6px; color: #fafafa; }
+.msg.live .bubble { border-color: rgba(160,220,255,.28); box-shadow: 0 0 24px rgba(140,200,255,.08); }
+.msg.live .av { color: #cfeaff; }
 .msg.nudge .bubble { border-color: rgba(255,255,255,.28); box-shadow: 0 0 24px rgba(255,255,255,.08); }
 .msg.system { justify-content: center; }
 .msg.system .bubble { background: rgba(0,0,0,.28); font-size: 12.5px; color: #cfcfcf; border-radius: 10px; padding: 6px 12px; max-width: 90%; text-align: center; }

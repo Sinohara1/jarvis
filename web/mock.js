@@ -7,7 +7,7 @@
   };
   const settings = { provider: 'gemini', models: { gemini: { chat: 'gemini-3.5-flash', lite: 'gemini-3.5-flash-lite' }, openai: { chat: 'gpt-4.1-mini', lite: 'gpt-4.1-nano' }, xai: { chat: 'grok-4-fast', lite: 'grok-4-fast' } },
     api_keys: { gemini: 'x', openai: '', xai: '' }, base_urls: { gemini: '', openai: '', xai: '' }, voice: 'ru-RU-DmitryNeural', tts_rate: 5, tts_volume: 85, speak_replies: true,
-    hotkey: 'ctrl+alt+j', wake_word: false, wake_threshold: 0.5, screen_check_sec: 90, title_check_sec: 5, nudge_cooldown_sec: 60, distraction_grace_sec: 8,
+    hotkey: 'ctrl+alt+j', wake_word: true, wake_mode: 'name', wake_threshold: 0.5, name_threshold: 0.5, live_mode: /live=1/.test(location.search), live_interval_sec: 45, live_min_gap_sec: 180, live_talk: 'some', live_reply_sec: 8, screen_check_sec: 90, title_check_sec: 5, nudge_cooldown_sec: 60, distraction_grace_sec: 8,
     distractions: ['tiktok', 'shorts', 'reels', 'instagram'], focus_minutes: 25, break_minutes: 5, rounds: 1, autostart: false, always_on_top: false, close_to_tray: true,
     persona: '', confirm_actions: false, custom_commands: [], user_name: 'Вова', assistant_name: (/name=([^&]+)/.exec(location.search) || [])[1] ? decodeURIComponent(/name=([^&]+)/.exec(location.search)[1]) : 'Джарвис', character_preset: 'butler', character: '' };
   const emit = (e, d) => window.J.onEvents([{ e, d }]);
@@ -19,7 +19,7 @@
   const tm = /tab=(\w+)/.exec(location.search);
   if (tm) setTimeout(() => document.querySelector(`.tab[data-tab=${tm[1]}]`).click(), 400);
   window.MOCK_API = {
-    init: async () => ({ version: '1.1.0', settings, providers, presets: [
+    init: async () => ({ version: '1.2.0', settings, providers, presets: [
       { key: 'butler', label: 'Джарвис-дворецкий', prompt: 'Спокойный, остроумный и заботливый, как Джарвис из «Железного человека», но без пафоса.', voice: 'ru-RU-DmitryNeural', rate: 0 },
       { key: 'friend', label: 'Друг', prompt: 'Тёплый, простой и весёлый, как лучший друг.', voice: 'ru-RU-DmitryNeural', rate: 8 },
       { key: 'coach', label: 'Строгий тренер', prompt: 'Строгий, требовательный тренер.', voice: 'ru-RU-DmitryNeural', rate: 6 },
@@ -31,7 +31,7 @@
       { icon: 'bell', title: 'Напоминания', desc: 'Через N минут', example: 'Напомни через 15 минут' }],
       tools: [], chat: [], focus, stats: { today: '42 мин', week: '5 ч 10 мин', month: '12 ч', total: '30 ч', streak: '3 дня', distractions: 2,
       days: ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((l, i) => ({ label: l, date: '0' + (i + 1) + '.10', min: [30, 55, 0, 80, 25, 60, 42][i] })) },
-      state: 'idle', hotkey: 'Ctrl+Alt+J', autostart: false, wake: { enabled: false }, maximized: false, has_key: true, data_dir: 'C:\\Users\\rpgpe\\AppData\\Local\\Jarvis', update: false }),
+      state: 'idle', hotkey: 'Ctrl+Alt+J', autostart: false, wake: { enabled: true, mode: settings.wake_mode, phrase: settings.assistant_name, downloading: false, error: null }, live: { enabled: settings.live_mode, status: settings.live_mode ? '10:58 посмотрел — молчу (пишет код в VS Code)' : 'Выключен' }, maximized: false, has_key: true, data_dir: 'C:\\Users\\rpgpe\\AppData\\Local\\Jarvis', update: false }),
     send: async (text) => {
       emit('state', { state: 'thinking', detail: 'Думаю…' });
       setTimeout(() => emit('chat', { role: 'user', text }), 50);
@@ -45,7 +45,9 @@
     listen: async () => { emit('state', { state: 'listening' }); setTimeout(() => emit('state', { state: 'idle' }), 3000); },
     stop_speaking: async () => {}, new_chat: async () => {}, get_chat: async () => [],
     save: async (p) => { const m = (a, b) => { for (const k in b) { if (b[k] && typeof b[k] === 'object' && !Array.isArray(b[k])) { a[k] = a[k] || {}; m(a[k], b[k]); } else a[k] = b[k]; } }; m(settings, p); return { ok: true, settings, hotkey: 'Ctrl+Alt+J', has_key: true }; },
-    set_wake: async (on) => { settings.wake_word = on; return { ok: true, settings, wake: { enabled: on } }; },
+    set_wake: async (on) => window.MOCK_API.set_wake_mode(on ? 'name' : 'off'),
+    set_wake_mode: async (mode) => { settings.wake_mode = mode; return { ok: true, settings, wake: { enabled: mode !== 'off', mode, phrase: settings.assistant_name, downloading: false, error: null } }; },
+    set_live: async (on) => { settings.live_mode = on; return { ok: true, settings, live: { enabled: on, status: on ? 'Включён — присматриваюсь' : 'Выключен' } }; },
     test_ai: async () => 'gemini-3.5-flash: «Да» за 1.0 с', test_voice: async () => {},
     focus_start: async (task, min) => { Object.assign(focus, { active: true, task, phase: 'focus', phase_label: 'Фокус', running: true, remaining: min * 60, total: min * 60 }); return { ok: true, focus, first_block_ends_at: '22:10' }; },
     focus_stop: async () => { focus.active = false; return focus; }, focus_pause: async () => { focus.running = !focus.running; return focus; }, focus_skip: async () => focus, focus_state: async () => focus,

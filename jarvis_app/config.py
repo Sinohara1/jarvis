@@ -141,8 +141,10 @@ DEFAULT_SETTINGS: dict = {
     "tts_volume": 85,       # 0..100
     "speak_replies": True,
     "hotkey": "ctrl+alt+j",
-    "wake_word": False,
-    "wake_threshold": 0.5,
+    "wake_word": False,      # legacy mirror of wake_mode != "off" (older versions read it)
+    "wake_mode": "off",      # "name" (Vosk, assistant's name) | "hey_jarvis" (openWakeWord) | "off"
+    "wake_threshold": 0.5,   # Hey Jarvis model score threshold
+    "name_threshold": 0.5,   # name spotting strictness (lower = reacts more eagerly)
     "screen_check_sec": 90,  # 0 = off
     "title_check_sec": 5,
     "nudge_cooldown_sec": 60,
@@ -162,7 +164,16 @@ DEFAULT_SETTINGS: dict = {
     "assistant_name": "Джарвис",
     "character_preset": "butler",  # key from persona.PRESETS or "custom"
     "character": "",               # free text; empty = preset text
+    # v1.2 live mode: proactive remarks after looking at the screen
+    "live_mode": False,
+    "live_interval_sec": 45,
+    "live_min_gap_sec": 180,
+    "live_talk": "some",           # rare | some | often
+    "live_reply_sec": 8,           # listen this long after a question (0 = off)
 }
+
+WAKE_MODES = ("name", "hey_jarvis", "off")
+LIVE_TALK = ("rare", "some", "often")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -209,17 +220,30 @@ def normalize_settings(raw: dict) -> dict:
     s["focus_minutes"] = _clamp_int(s.get("focus_minutes"), 1, 240, 25)
     s["break_minutes"] = _clamp_int(s.get("break_minutes"), 1, 60, 5)
     s["rounds"] = _clamp_int(s.get("rounds"), 1, 8, 1)
-    try:
-        s["wake_threshold"] = max(0.1, min(0.95, float(s.get("wake_threshold", 0.5))))
-    except (TypeError, ValueError):
-        s["wake_threshold"] = 0.5
+    for k in ("wake_threshold", "name_threshold"):
+        try:
+            s[k] = max(0.1, min(0.95, float(s.get(k, 0.5))))
+        except (TypeError, ValueError):
+            s[k] = 0.5
+    raw_d = raw if isinstance(raw, dict) else {}
+    mode = str(raw_d.get("wake_mode") or "").strip().lower()
+    if mode not in WAKE_MODES:  # settings from <= 1.1: only the bool existed
+        mode = "hey_jarvis" if bool(raw_d.get("wake_word")) else "off"
+    s["wake_mode"] = mode
+    s["wake_word"] = mode != "off"
+    s["live_mode"] = bool(s.get("live_mode"))
+    s["live_interval_sec"] = _clamp_int(s.get("live_interval_sec"), 20, 600, 45)
+    s["live_min_gap_sec"] = _clamp_int(s.get("live_min_gap_sec"), 30, 1800, 180)
+    s["live_reply_sec"] = _clamp_int(s.get("live_reply_sec"), 0, 20, 8)
+    if s.get("live_talk") not in LIVE_TALK:
+        s["live_talk"] = "some"
     d = s.get("distractions")
     if isinstance(d, str):
         d = d.splitlines()
     if not isinstance(d, list):
         d = list(DEFAULT_DISTRACTIONS)
     s["distractions"] = [str(x).strip().lower() for x in d if str(x).strip()]
-    for b in ("speak_replies", "wake_word", "autostart", "always_on_top", "close_to_tray", "confirm_actions"):
+    for b in ("speak_replies", "autostart", "always_on_top", "close_to_tray", "confirm_actions"):
         s[b] = bool(s.get(b))
     s["persona"] = str(s.get("persona") or "")[:4000]
     s["user_name"] = str(s.get("user_name") or "").strip()[:40]

@@ -33,6 +33,7 @@ SYSTEM_PROMPT = """Ты — {name}, личный голосовой ИИ-асс�
 - Когда пользователь говорит, чем сейчас занимается и сколько времени («делаю домашку по физике 40 минут») — сразу вызывай start_focus.
 - Ты не умеешь удалять файлы, закрывать программы и отправлять сообщения. Если просят — честно скажи, что пока так не умеешь.
 - Если не расслышал или запрос непонятен — переспроси одной короткой фразой.
+- «Живой режим» — ты сам поглядываешь на экран и подсказываешь, когда это уместно. Включай/выключай его через set_live_mode: «следи и подсказывай», «включи живой режим» — включить; «выключи живой режим», а также «тихо», «хватит», «помолчи», «не мешай», если живой режим включён и речь о твоих подсказках, — выключить.
 """
 
 
@@ -253,6 +254,48 @@ class Brain:
         raw = prov.generate(lite_m, prompt, image_jpeg=jpeg, json_schema=SCREEN_SCHEMA,
                             timeout=30, temperature=0.0, max_tokens=300)
         return parse_screen_verdict(raw)
+
+    def live_decide(self, jpeg: bytes, system: str, prompt: str) -> dict:
+        """Live mode: one structured decision {speak, kind, text, reason, confidence, activity}.
+        Lite model first (bigger free quota), chat model as a fallback on overload/unknown model.
+        RateLimitError propagates so the caller can back off."""
+        from .live import LIVE_SCHEMA, parse_decision
+        s = self.get_settings()
+        pname = s["provider"]
+        prov = self.provider(pname)
+        chat_m, lite_m = self.models(pname)
+        last: Exception | None = None
+        for model in dict.fromkeys([lite_m, chat_m]):
+            try:
+                t0 = time.monotonic()
+                raw = prov.generate(model, prompt, image_jpeg=jpeg, json_schema=LIVE_SCHEMA, system=system,
+                                    timeout=30, temperature=0.3, max_tokens=700)
+                d = parse_decision(raw)
+                d["model"] = model
+                log.info("live decision via %s in %.1fs", model, time.monotonic() - t0)
+                return d
+            except (P.OverloadedError, P.ModelNotFoundError) as e:
+                last = e
+        raise last or P.ProviderError("Нет ответа")
+
+    def note_remark(self, text: str) -> None:
+        """Put a proactive remark into the chat history so a spoken reply has context."""
+        with self.lock:
+            s = self.get_settings()
+            pname = s["provider"]
+            if self._hist_provider != pname:
+                self.history = []
+                self._hist_provider = pname
+            try:
+                prov = self.provider(pname)
+            except P.ProviderError:
+                return
+            self.history.append(prov.user_message("(Живой режим: ты сам посмотрел на мой экран и сказал мне следующее.)"))
+            if pname == "gemini":
+                self.history.append({"role": "model", "parts": [{"text": text}]})
+            else:
+                self.history.append({"role": "assistant", "content": text})
+            self._trim()
 
     def test_connection(self, provider: str) -> str:
         prov = self.provider(provider)

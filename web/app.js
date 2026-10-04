@@ -10,7 +10,10 @@ const isDefaultName = (n) => /^(джарвис|jarvis)$/i.test(String(n).trim())
 const VOICE_RU = { 'ru-RU-DmitryNeural': 'Дмитрий', 'ru-RU-SvetlanaNeural': 'Светлана' };
 const vname = (v) => VOICE_RU[v] || String(v).replace(/^[a-z]{2}-[A-Z]{2}-/, '').replace(/Neural$/, '');
 const S = { settings: {}, providers: {}, voices: [], chat: [], focus: {}, stats: {}, state: 'idle', tab: 'home',
-            chatMode: false, attach: false, wake: { enabled: false }, echo: [], hotkey: 'Ctrl+Alt+J' };
+            chatMode: false, attach: false, wake: { enabled: false, mode: 'off' }, echo: [], hotkey: 'Ctrl+Alt+J',
+            live: { enabled: false, status: '' }, wakeDl: null };
+const TALK = [['rare', 'Редко'], ['some', 'Иногда'], ['often', 'Часто']];
+const WAKE_MODES = [['name', 'По имени'], ['hey_jarvis', 'Hey Jarvis'], ['off', 'Выкл']];
 
 const TABS = [
   ['home', 'home', 'Главная'], ['commands', 'terminal', 'Команды'], ['model', 'box', 'Модель'],
@@ -57,7 +60,8 @@ async function start() {
   const d = await API.init();
   Object.assign(S, { settings: d.settings, providers: d.providers, voices: d.voices, abilities: d.abilities, tools: d.tools,
                      chat: d.chat || [], focus: d.focus, stats: d.stats, version: d.version, hotkey: d.hotkey,
-                     autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir, presets: d.presets || [] });
+                     autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir, presets: d.presets || [],
+                     live: d.live || { enabled: false, status: '' } });
   applyName();
   setState(d.state || 'idle');
   setMax(d.maximized);
@@ -83,6 +87,7 @@ window.J = {
       return;
     }
     if (cmd === 'chat') { selectTab('home'); enterChat(true); return; }
+    if (cmd.startsWith('scroll:')) { const el = document.querySelector(cmd.slice(7)); if (el) el.scrollIntoView({ block: 'start' }); return; }
     $('#input').value = cmd; send();
   },
   onEvents(list) { for (const { e, d } of list) { try { onEvent(e, d || {}); } catch (err) { console.error(err); } } },
@@ -96,7 +101,9 @@ function onEvent(e, d) {
     case 'focus': case 'tick': if (d.focus) { S.focus = d.focus; renderFocusLive(); } break;
     case 'notify': if (S.tab !== 'home' || !S.chatMode) toast(d.text); break;
     case 'error': toast(d.text, 'err', 6000); break;
-    case 'wake': S.wake = { enabled: !!d.enabled }; renderComposer(); if (d.error) toast('Слово-активатор недоступно: ' + d.error, 'err', 6000); break;
+    case 'wake': S.wake = d; if (!d.downloading) S.wakeDl = null; renderComposer(); renderWakeStatus(); if (d.error) toast('Слово-активатор недоступно: ' + d.error, 'err', 7000); break;
+    case 'wake_dl': S.wakeDl = d; renderComposer(); renderWakeStatus(); break;
+    case 'live': S.live = { enabled: !!d.enabled, status: d.status || '' }; S.settings.live_mode = !!d.enabled; renderComposer(); renderLiveStatus(); break;
     case 'visible': window.BG && BG.setPaused(!d.visible); break;
     case 'window': setMax(d.maximized); break;
     case 'update': toast(`Доступна новая версия ${d.tag}`, '', 0, [['Посмотреть', openVersions]]); break;
@@ -139,8 +146,8 @@ function renderChat() {
 function msgEl(m) {
   const el = document.createElement('div');
   const role = m.role === 'jarvis' ? 'jarvis' : m.role === 'user' ? 'user' : m.role === 'tool' ? 'tool' : 'system';
-  el.className = `msg ${role}${m.kind === 'nudge' ? ' nudge' : ''}`;
-  if (role === 'jarvis') el.innerHTML = `<div class="av">${icon(m.kind === 'nudge' ? 'target' : 'spark', 14)}</div><div class="col"><div class="who">${esc(NM())}</div><div class="bubble">${esc(m.text)}</div></div>`;
+  el.className = `msg ${role}${m.kind === 'nudge' ? ' nudge' : ''}${m.kind === 'live' ? ' live' : ''}`;
+  if (role === 'jarvis') el.innerHTML = `<div class="av">${icon(m.kind === 'nudge' ? 'target' : m.kind === 'live' ? 'eye' : 'spark', 14)}</div><div class="col"><div class="who">${esc(NM())}</div><div class="bubble">${esc(m.text)}</div></div>`;
   else if (role === 'user') el.innerHTML = `<div class="bubble">${esc(m.text)}</div>`;
   else if (role === 'tool') el.innerHTML = `<span class="toolchip">${icon('zap', 12)}${esc(m.text)}</span>`;
   else el.innerHTML = `<div class="bubble">${esc(m.text)}</div>`;
@@ -194,7 +201,7 @@ async function send(text, opts = {}) {
 // ───────────────────────── composer ─────────────────────────
 function modelLabel() {
   const s = S.settings; const p = s.provider; const m = (s.models && s.models[p] && s.models[p].chat) || '';
-  return `${p}/${m}`;
+  return m || p;
 }
 function watchLabel() {
   const v = S.settings.screen_check_sec;
@@ -204,8 +211,13 @@ function watchLabel() {
 function renderComposer() {
   const s = S.settings;
   $('#confirm-tgl').classList.toggle('on', !!s.confirm_actions);
+  $('#live-tgl').classList.toggle('on', !!S.live.enabled);
+  $('#live-wrap').title = 'Живой режим: ассистент сам поглядывает на экран и говорит, только когда это уместно' + (S.live.enabled && S.live.status ? '\nСейчас: ' + S.live.status : '');
   const wb = $('#wake-btn');
-  wb.innerHTML = icon('mic', 15) + `<span>${S.wake.enabled ? 'Слушаю «Hey Jarvis»' : 'Запустить'}</span>`;
+  const dl = S.wake.downloading || S.wakeDl;
+  const pct = S.wakeDl && S.wakeDl.total ? Math.round(S.wakeDl.done / S.wakeDl.total * 100) : 0;
+  wb.innerHTML = icon('mic', 15) + `<span>${S.wake.enabled ? `«${esc(wakePhrase())}»` : dl ? `Модель ${pct}%` : 'Запустить'}</span>`;
+  wb.title = S.wake.enabled ? `Слушаю «${wakePhrase()}» — нажми, чтобы выключить` : dl ? 'Скачиваю модель распознавания имени (~45 МБ)…' : 'Звать голосом по имени';
   wb.classList.toggle('on', !!S.wake.enabled);
   const vb = $('#voice-btn');
   vb.innerHTML = icon(s.speak_replies ? 'vol' : 'volx', 17);
@@ -403,20 +415,28 @@ function buildVoice() {
     <div class="card sect"><h3>${icon('keyboard', 15)}Горячая клавиша</h3>
       <div class="row"><div class="grow"><div class="t" id="v-hk">${esc(S.hotkey)}</div><div class="s">Удерживай — говоришь. Короткое нажатие — слушаю до паузы. Повторное — стоп.</div></div><button id="v-hk-btn" class="btn">Изменить</button></div></div>
     <div class="card sect"><h3>${icon('mic', 15)}Слово-активатор</h3>
-      <div class="row"><div class="grow"><div class="t">Слушать «Hey Jarvis»</div><div class="s">Работает офлайн, без отправки звука в интернет. Говори по-английски: «Hey Jarvis».</div></div>${tgl('v-wake', S.wake.enabled || s.wake_word)}</div>
-      <div class="row"><div class="grow"><div class="t">Чувствительность</div><div class="s">Меньше — реагирует охотнее (и чаще ошибается)</div></div><input id="v-thr" class="slider" style="max-width:240px" type="range" min="10" max="95" value="${Math.round(s.wake_threshold * 100)}"><span class="val" id="v-thr-v">${s.wake_threshold.toFixed(2)}</span></div></div>`;
+      <div class="row"><div class="grow"><div class="t">Как звать голосом</div><div class="s" id="v-wstat"></div></div>
+        <div class="seg" id="v-wmode">${WAKE_MODES.map(([k, l]) => `<button data-w="${k}" class="${k === s.wake_mode ? 'on' : ''}">${k === 'name' ? esc(`По имени «${NM()}»`) : l}</button>`).join('')}</div></div>
+      ${s.wake_mode !== 'off' ? `<div class="row"><div class="grow"><div class="t">Чувствительность</div><div class="s">Меньше — реагирует охотнее (и чаще ошибается)</div></div><input id="v-thr" class="slider" style="max-width:240px" type="range" min="10" max="95" value="${Math.round(thrVal() * 100)}"><span class="val" id="v-thr-v">${thrVal().toFixed(2)}</span></div>` : ''}
+      <div class="note">${s.wake_mode === 'hey_jarvis' ? 'Скажи по-английски <b>«Hey Jarvis»</b> — это фиксированная фраза, она не зависит от имени.' :
+        `<b>По имени</b>: скажи «${esc(NM())}» или «Эй, ${esc(NM())}» — и сразу просьбу («${esc(NM())}, открой телеграм»), или подожди сигнал. Имя меняется во вкладке «ИИ» — я сразу начну откликаться на новое.`}
+        Всё распознаётся офлайн, звук никуда не отправляется. Для режима «по имени» один раз скачивается модель Vosk (~45 МБ).</div></div>`;
   $('#v-voice').onchange = () => save({ voice: $('#v-voice').value });
   $('#v-test').onclick = () => API.test_voice($('#v-voice').value, +$('#v-rate').value, +$('#v-vol').value);
   $('#v-rate').oninput = () => { const v = +$('#v-rate').value; $('#v-rate-v').textContent = (v > 0 ? '+' : '') + v + '%'; };
   $('#v-rate').onchange = () => save({ tts_rate: +$('#v-rate').value }, true);
   $('#v-vol').oninput = () => { $('#v-vol-v').textContent = $('#v-vol').value + '%'; };
   $('#v-vol').onchange = () => save({ tts_volume: +$('#v-vol').value }, true);
-  $('#v-thr').oninput = () => { $('#v-thr-v').textContent = (+$('#v-thr').value / 100).toFixed(2); };
-  $('#v-thr').onchange = () => save({ wake_threshold: +$('#v-thr').value / 100 }, true);
+  if ($('#v-thr')) {
+    $('#v-thr').oninput = () => { $('#v-thr-v').textContent = (+$('#v-thr').value / 100).toFixed(2); };
+    $('#v-thr').onchange = () => save({ [S.settings.wake_mode === 'name' ? 'name_threshold' : 'wake_threshold']: +$('#v-thr').value / 100 }, true);
+  }
+  $$('#v-wmode [data-w]').forEach((b) => b.onclick = () => setWakeMode(b.dataset.w));
+  renderWakeStatus();
   $('#v-speak').onclick = async () => { await save({ speak_replies: !S.settings.speak_replies }, true); buildVoice(); };
-  $('#v-wake').onclick = () => toggleWake().then(buildVoice);
   $('#v-hk-btn').onclick = captureHotkey;
 }
+function thrVal() { const s = S.settings; return s.wake_mode === 'name' ? (s.name_threshold ?? 0.5) : s.wake_threshold; }
 function captureHotkey() {
   const btn = $('#v-hk-btn'), lbl = $('#v-hk');
   lbl.textContent = 'Нажми новое сочетание… (Esc — отмена)'; btn.disabled = true;
@@ -434,10 +454,42 @@ function captureHotkey() {
   const done = () => { window.removeEventListener('keydown', onKey, true); btn.disabled = false; };
   window.addEventListener('keydown', onKey, true);
 }
+function wakePhrase() { return S.wake.mode === 'hey_jarvis' ? 'Hey Jarvis' : NM(); }
+function wakeHint() { return S.wake.mode === 'hey_jarvis' ? 'Скажи «Hey Jarvis», чтобы позвать меня' : `Скажи «${NM()}» или «Эй, ${NM()}» — можно сразу с просьбой`; }
 async function toggleWake() {
-  const on = !S.wake.enabled;
+  const on = !(S.wake.enabled || S.wake.downloading);
   const r = await API.set_wake(on);
-  if (r && r.ok) { S.settings = r.settings; S.wake = r.wake; renderComposer(); toast(S.wake.enabled ? 'Скажи «Hey Jarvis», чтобы позвать меня' : 'Слово-активатор выключено', '', 2200); }
+  if (r && r.ok) { S.settings = r.settings; S.wake = r.wake; renderComposer();
+    toast(S.wake.enabled ? wakeHint() : S.wake.downloading ? 'Скачиваю модель распознавания (~45 МБ, один раз)…' : 'Слово-активатор выключено', '', 2600); }
+}
+async function setWakeMode(mode) {
+  const r = await API.set_wake_mode(mode);
+  if (r && r.ok) { S.settings = r.settings; S.wake = r.wake; renderComposer(); buildVoice();
+    if (mode === 'off') toast('Слово-активатор выключено', '', 1600);
+    else if (S.wake.downloading) toast('Скачиваю модель распознавания (~45 МБ, один раз)…', '', 3000);
+    else if (S.wake.enabled) toast(wakeHint(), '', 2600); }
+}
+function renderWakeStatus() {
+  const el = $('#v-wstat'); if (!el) return;
+  const w = S.wake;
+  let t = '';
+  if (w.mode === 'off') t = 'Выключено — зови горячей клавишей ' + S.hotkey;
+  else if (w.downloading || S.wakeDl) { const d = S.wakeDl || {}; const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+    t = `Скачиваю модель распознавания… ${pct}%` + (d.total ? ` · ${(d.done / 1048576).toFixed(1)} из ${(d.total / 1048576).toFixed(1)} МБ` : ''); }
+  else if (w.error) t = 'Не работает: ' + w.error;
+  else if (w.enabled) t = w.mode === 'name' ? `Слушаю «${NM()}» и «Эй, ${NM()}»` : 'Слушаю «Hey Jarvis»';
+  else t = 'Запускаю…';
+  el.textContent = t;
+}
+async function toggleLive() {
+  const on = !S.live.enabled;
+  const r = await API.set_live(on);
+  if (r && r.ok) { S.settings = r.settings; S.live = r.live; renderComposer(); buildAI();
+    toast(on ? 'Живой режим включён: подскажу, когда это уместно' : 'Живой режим выключен', '', 2400); }
+}
+function renderLiveStatus() {
+  const el = $('#a-lstat'); if (el) el.textContent = S.live.enabled ? (S.live.status || 'Включён') : 'Выключен';
+  const t = $('#a-live'); if (t) t.classList.toggle('on', !!S.live.enabled);
 }
 
 function applyName() {
@@ -445,7 +497,8 @@ function applyName() {
   const wm = $('#wordmark .wm');
   if (wm) { wm.textContent = isDefaultName(n) ? 'Jarvis' : n; $('#wordmark').classList.toggle('long', n.length > 9); $('#wordmark').classList.toggle('xlong', n.length > 14); }
   document.title = n;
-  const t = $('#wake-btn'); if (t) t.title = 'Слово-активатор «Hey Jarvis» (не зависит от имени ассистента)';
+  const t = $('#wake-btn'); if (t) t.title = S.wake.mode === 'hey_jarvis' ? 'Слово-активатор «Hey Jarvis»' : `Слово-активатор: позови «${n}»`;
+  renderComposer();
   $$('#msgs .msg.jarvis .who').forEach((el) => { el.textContent = n; });
 }
 function presetOf(key) { return (S.presets || []).find((p) => p.key === key); }
@@ -461,7 +514,7 @@ function buildAI() {
     `<div class="card sect"><h3>${icon('spark', 15)}Имя</h3>
       <div class="grid2"><div class="field"><label>Как зовут ассистента</label><input id="a-aname" class="inp" maxlength="30" placeholder="Джарвис" value="${esc(s.assistant_name || 'Джарвис')}"></div>
         <div class="field"><label>Как ассистенту обращаться к тебе</label><input id="a-name" class="inp" maxlength="40" placeholder="Имя (необязательно)" value="${esc(s.user_name)}"></div></div>
-      <div class="note">Имя видно в окне, трее и чате, и так ассистент называет себя в ответах. Слово-активатор не меняется: чтобы позвать голосом, всё так же говори <b>«Hey Jarvis»</b>.</div></div>
+      <div class="note">Имя видно в окне, трее и чате, и так ассистент называет себя в ответах. ${s.wake_mode === 'name' ? `Голосом зови по имени: <b>«${esc(s.assistant_name || 'Джарвис')}»</b> или «Эй, ${esc(s.assistant_name || 'Джарвис')}» — новое имя подхватывается сразу.` : s.wake_mode === 'hey_jarvis' ? 'Сейчас слово-активатор — «Hey Jarvis». Во вкладке «Голос» можно звать по имени.' : 'Во вкладке «Голос» можно включить вызов голосом по этому имени.'}</div></div>
     <div class="card sect"><h3>${icon('user', 15)}Характер</h3>
       <div class="pchips">${(S.presets || []).map((p) => `<button class="pchip${p.key === pk ? ' on' : ''}" data-preset="${p.key}">${esc(p.label)}</button>`).join('')}<button class="pchip${pk === 'custom' ? ' on' : ''}" data-preset="custom">${icon('edit', 12)}Свой</button></div>
       <div class="field" style="margin-top:12px"><label>Характер — как ассистент говорит и ведёт себя (можно переписать своими словами)</label>
@@ -472,6 +525,16 @@ function buildAI() {
         <textarea id="a-persona" class="inp" placeholder="Например: я учусь в 10 классе, готовлюсь к ЕГЭ. Шути иногда.">${esc(s.persona)}</textarea></div>
       <div class="row" style="margin-top:6px"><div class="grow"><div class="t">Подтверждать опасные действия</div><div class="s">Спрашивать перед открытием программ, файлов и сайтов</div></div>${tgl('a-confirm', s.confirm_actions)}</div>
       <div class="row"><button id="a-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="a-reset" class="btn ghost">${icon('refresh', 14)}Новый чат — очистить память разговора</button></div></div>
+    <div class="card sect" id="a-livecard"><h3>${icon('eye', 15)}Живой режим<span class="badge">новое</span></h3>
+      <div class="row"><div class="grow"><div class="t">Сам поглядывать на экран и подсказывать</div><div class="s" id="a-lstat">${esc(S.live.enabled ? (S.live.status || 'Включён') : 'Выключен')}</div></div>${tgl('a-live', S.live.enabled)}</div>
+      <div class="row"><div class="grow"><div class="t">Разговорчивость</div><div class="s">Редко — только очевидные случаи; часто — смелее и с меньшими паузами</div></div>
+        <div class="seg" id="a-talk">${TALK.map(([k, l]) => `<button data-t="${k}" class="${k === s.live_talk ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+      <div class="grid3" style="margin-top:10px">
+        <div class="field"><label>Смотреть на экран</label><select id="a-lint" class="inp">${selOpts([[30, 'каждые 30 с'], [45, 'каждые 45 с'], [60, 'каждую минуту'], [90, 'каждые 90 с'], [120, 'каждые 2 мин'], [180, 'каждые 3 мин']], s.live_interval_sec, (v) => `каждые ${v} с`)}</select></div>
+        <div class="field"><label>Пауза между репликами</label><select id="a-lgap" class="inp">${selOpts([[60, '1 мин'], [120, '2 мин'], [180, '3 мин'], [300, '5 мин'], [600, '10 мин'], [900, '15 мин']], s.live_min_gap_sec, (v) => `${Math.round(v / 60)} мин`)}</select></div>
+        <div class="field"><label>Ждать ответ на вопрос</label><select id="a-lrep" class="inp">${selOpts([[0, 'не слушать'], [5, '5 с'], [8, '8 с'], [12, '12 с'], [20, '20 с']], s.live_reply_sec, (v) => `${v} с`)}</select></div>
+      </div>
+      <div class="note">Включается и голосом: «следи и подсказывай», выключается — «тихо», «хватит», «выключи живой режим». Молчу, пока ты говоришь со мной, во время звонков и полноэкранных игр/видео, и первые 20 секунд после смены окна. Во время фокус-сессии про отвлечения напоминает страж — без двойных замечаний. Снимок экрана уменьшается, уходит только в модель и не сохраняется на диск. При лимите бесплатного API смотрю реже.</div></div>
     <div class="card sect"><h3>${icon('shield', 15)}Страж фокуса</h3>
       <div class="grid2">
         <div class="field"><label>Смотреть на экран (ИИ, во время фокуса)</label><select id="a-screen" class="inp">${opts.map(([v, l]) => `<option value="${v}" ${v === s.screen_check_sec ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
@@ -500,6 +563,15 @@ function buildAI() {
   $('#a-title').onchange = () => save({ title_check_sec: +$('#a-title').value });
   $('#a-cool').onchange = () => save({ nudge_cooldown_sec: +$('#a-cool').value });
   $('#a-grace').onchange = () => save({ distraction_grace_sec: +$('#a-grace').value });
+  $('#a-live').onclick = () => toggleLive();
+  $$('#a-talk [data-t]').forEach((b) => b.onclick = async () => { if (await save({ live_talk: b.dataset.t }, true)) { buildAI(); toast('Разговорчивость: ' + b.textContent, '', 1500); } });
+  $('#a-lint').onchange = () => save({ live_interval_sec: +$('#a-lint').value });
+  $('#a-lgap').onchange = () => save({ live_min_gap_sec: +$('#a-lgap').value });
+  $('#a-lrep').onchange = () => save({ live_reply_sec: +$('#a-lrep').value });
+}
+function selOpts(opts, cur, fmt) {
+  if (!opts.some((o) => o[0] === cur)) opts = [...opts, [cur, fmt(cur)]].sort((a, b) => a[0] - b[0]);
+  return opts.map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`).join('');
 }
 async function saveName() {
   const n = $('#a-aname').value.trim() || 'Джарвис';
@@ -706,6 +778,7 @@ function bindStatic() {
   $('#slash').onclick = (e) => popCommands(e.currentTarget);
   $('#plus').onclick = (e) => popPlus(e.currentTarget);
   $('#clip').onclick = () => { S.attach = !S.attach; $('#clip').classList.toggle('on', S.attach); toast(S.attach ? 'К следующему сообщению приложу снимок экрана' : 'Снимок экрана не прикладывается', '', 1800); $('#input').focus(); };
+  $('#live-wrap').onclick = (e) => { e.preventDefault(); toggleLive(); };
   $('#confirm-wrap').onclick = async (e) => { e.preventDefault(); await save({ confirm_actions: !S.settings.confirm_actions }, true); toast(S.settings.confirm_actions ? 'Буду спрашивать перед действиями' : 'Действую сразу', '', 1600); buildAI(); };
   $('#wake-btn').onclick = () => toggleWake();
   $('#voice-btn').onclick = async () => { const on = !S.settings.speak_replies; if (!on) API.stop_speaking(); await save({ speak_replies: on }, true); toast(on ? 'Голос включён' : 'Отвечаю только текстом', '', 1500); };

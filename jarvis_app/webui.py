@@ -35,6 +35,7 @@ TOOL_RU = {
     "stop_focus": "останавливаю фокус", "pause_focus": "пауза фокуса", "focus_status": "смотрю статус",
     "set_reminder": "ставлю напоминание", "list_reminders": "смотрю напоминания",
     "cancel_reminders": "отменяю напоминания", "get_time": "смотрю время", "look_at_screen": "смотрю на экран",
+    "set_live_mode": "живой режим",
 }
 
 ABILITIES = [
@@ -45,6 +46,7 @@ ABILITIES = [
     ("target", "Фокус-сессия", "Таймер + страж от TikTok и шортсов", "Я делаю домашку по физике 40 минут"),
     ("bell", "Напоминания и таймеры", "Через N минут или в ЧЧ:ММ", "Напомни через 15 минут выпить воды"),
     ("monitor", "Посмотреть на экран", "Скриншот активного монитора → ответ", "Что у меня на экране?"),
+    ("eye", "Живой режим", "Сам поглядывает на экран и подсказывает, когда уместно", "Следи и подсказывай"),
     ("clock", "Время и дата", "", "Сколько сейчас времени?"),
 ]
 
@@ -243,7 +245,8 @@ class Bridge:
                       for t in TOOLS],
             "chat": self._chat.snapshot(), "focus": self._focus_payload(), "stats": self._stats_payload(),
             "state": c.state, "hotkey": hotkey_pretty(s["hotkey"]), "autostart": get_autostart() or s["autostart"],
-            "wake": {"enabled": bool(c.wake), "error": None}, "maximized": self._frame.maximized,
+            "wake": c.wake_info(), "maximized": self._frame.maximized,
+            "live": {"enabled": bool(s["live_mode"]), "status": c.live_status},
             "has_key": bool(api_key_for(s, prov)), "data_dir": DATA_DIR,
             "presets": persona.presets_payload(),
         }
@@ -309,9 +312,27 @@ class Bridge:
                 "has_key": bool(api_key_for(s, s["provider"]))}
 
     def set_wake(self, on: bool) -> dict:
-        r = self.save({"wake_word": bool(on)})
-        r["wake"] = {"enabled": bool(self._core.wake)}
+        """Home-card chip: off → by name (or the last mode), on → off."""
+        mode = "off"
+        if on:
+            mode = self._core.settings.get("_last_wake_mode") or "name"
+        return self.set_wake_mode(mode)
+
+    def set_wake_mode(self, mode: str) -> dict:
+        mode = str(mode or "off")
+        patch: dict = {"wake_mode": mode}
+        if mode != "off":
+            patch["_last_wake_mode"] = mode
+        r = self.save(patch)
+        r["wake"] = self._core.wake_info()
         return r
+
+    def set_live(self, on: bool) -> dict:
+        self._core.set_live(bool(on))
+        s = self._core.settings
+        return {"ok": True, "settings": self._settings_payload(), "hotkey": hotkey_pretty(s["hotkey"]),
+                "has_key": bool(api_key_for(s, s["provider"])),
+                "live": {"enabled": bool(s["live_mode"]), "status": self._core.live_status}}
 
     def test_ai(self, provider: str, patch: dict | None = None) -> str:
         from .brain import Brain

@@ -30,6 +30,7 @@ if (-not (Test-Path -LiteralPath "jarvis.ico")) {
     --add-data "web;web" `
     --hidden-import pystray._win32 `
     --hidden-import clr `
+    --collect-all vosk `
     --exclude-module matplotlib --exclude-module scipy --exclude-module pandas `
     --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide6 --exclude-module gi `
     jarvis.pyw

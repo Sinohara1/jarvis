@@ -1,4 +1,4 @@
-"""`Jarvis.exe --selftest`: silent diagnostics written to jarvis.log (no mic, no sound, no screenshots sent)."""
+"""`Jarvis.exe --selftest`: silent diagnostics written to jarvis.log (no mic, no sound, no screenshots sent; vosk model only loaded if present)."""
 
 from __future__ import annotations
 
@@ -46,12 +46,23 @@ def run() -> int:
         import sounddevice as sd
         return sd.query_devices(kind="input")["name"]
 
+    def vosk_check():
+        import vosk  # noqa: F401  (libvosk.dll must be bundled)
+        from . import namewake
+        path = namewake.find_model()
+        if path:
+            vosk.SetLogLevel(-1)
+            vosk.Model(path)
+            return f"model ok: {path}"
+        return "library ok; model not downloaded yet (downloads on first «по имени»)"
+
     def ai():
         return Brain(lambda: s, None).test_connection(s.get("provider", "gemini"))
 
     step("tts", tts)
     step("wakeword", wake)
     step("mic", mic)
+    step("vosk", vosk_check)
     step("ai", ai)
     log.info("selftest done: %d failure(s)", fails)
     return fails

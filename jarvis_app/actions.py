@@ -120,6 +120,15 @@ TOOLS: list[dict] = [
         "parameters": {"type": "object", "properties": {}},
     },
     {
+        "name": "set_live_mode",
+        "description": "Включить или выключить «живой режим»: ассистент сам периодически смотрит на экран и, если уместно, "
+                       "подсказывает, спрашивает или хвалит. Включить: «следи и подсказывай», «включи живой режим», «присматривай за мной». "
+                       "Выключить: «выключи живой режим», «тихо», «хватит», «помолчи», «не мешай» (про подсказки).",
+        "parameters": {"type": "object", "properties": {
+            "enabled": {"type": "boolean", "description": "true — включить, false — выключить"}},
+            "required": ["enabled"]},
+    },
+    {
         "name": "look_at_screen",
         "description": "Посмотреть на экран пользователя (скриншот активного монитора) и ответить на вопрос о том, что там видно.",
         "parameters": {"type": "object", "properties": {
@@ -502,6 +511,9 @@ class Actions:
 
     def do_get_time(self) -> dict:
         return time_info()
+
+    def do_set_live_mode(self, enabled: bool = True) -> dict:
+        return self.core.set_live(bool(enabled))
 
     def do_look_at_screen(self, question: str = "Что на экране?") -> dict:
         return self.core.look_at_screen(question)

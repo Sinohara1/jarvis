@@ -222,6 +222,135 @@ def test_persona_and_prompt():
     assert persona.assistant_name({"assistant_name": "  "}) == "Джарвис"
 
 
+def test_v12_settings_migration():
+    s = normalize_settings({"wake_word": True})          # 1.1 settings with Hey Jarvis on
+    assert s["wake_mode"] == "hey_jarvis" and s["wake_word"] is True
+    s = normalize_settings({})
+    assert s["wake_mode"] == "off" and s["wake_word"] is False and s["live_mode"] is False
+    assert s["live_interval_sec"] == 45 and s["live_min_gap_sec"] == 180 and s["live_talk"] == "some" and s["live_reply_sec"] == 8
+    s = normalize_settings({"wake_mode": "name", "wake_word": False, "live_interval_sec": 3, "live_talk": "x",
+                            "live_min_gap_sec": 99999, "name_threshold": 7})
+    assert s["wake_mode"] == "name" and s["wake_word"] is True       # legacy mirror for older versions
+    assert s["live_interval_sec"] == 20 and s["live_talk"] == "some" and s["live_min_gap_sec"] == 1800
+    assert s["name_threshold"] == 0.95
+    assert normalize_settings(s)["wake_mode"] == "name"               # idempotent
+
+
+def test_live_policy_timing():
+    from jarvis_app.live import LivePolicy, talk_params, SETTLE_SEC
+    st = normalize_settings({"live_mode": True})
+    p = LivePolicy(); p.reset(now=0.0)
+    p.note_foreground(("code.exe", "main.py"), 0.0)
+    assert p.due(5.0, st) == (False, "settle")                 # first 20 s after enabling
+    assert p.due(SETTLE_SEC + 1, st)[0]
+    p.on_check(21.0)
+    assert p.due(40.0, st) == (False, "interval")              # 45 s interval
+    assert p.due(67.0, st)[0]
+    assert p.note_foreground(("chrome.exe", "TikTok"), 70.0)    # window changed
+    assert p.due(80.0, st) == (False, "change")
+    assert p.due(91.0, st)[0]
+    p.on_remark(100.0)
+    assert p.due(200.0, st) == (False, "gap")                  # 3 min between remarks
+    assert p.due(281.0, st)[0]
+    rare, often = talk_params({**st, "live_talk": "rare"}), talk_params({**st, "live_talk": "often"})
+    assert rare["gap"] > talk_params(st)["gap"] > often["gap"] and rare["conf"] > often["conf"]
+    assert talk_params(st, in_focus=True)["interval"] == 2 * talk_params(st)["interval"]
+
+
+def test_live_policy_accept_and_backoff():
+    from jarvis_app.live import LivePolicy
+    st = normalize_settings({"live_mode": True})
+    p = LivePolicy(); p.reset(now=0.0)
+    d = {"valid": True, "speak": True, "kind": "hint", "text": "В строке 12 опечатка в имени переменной.", "confidence": 0.9}
+    assert p.accept(d, 100.0, st) == (True, "")
+    assert p.accept({**d, "confidence": 0.5}, 100.0, st) == (False, "unsure")
+    assert p.accept({**d, "speak": False}, 100.0, st) == (False, "silent")
+    assert p.accept({**d, "kind": "nudge"}, 100.0, st, in_focus=True) == (False, "guard")   # no double nudges
+    p.remember(100.0, "пишет код", "VS Code", said=d["text"], kind="hint")
+    p.on_remark(100.0, "live")
+    assert p.accept(d, 150.0, st) == (False, "gap")
+    assert p.accept({**d, "text": "В строке 12 опечатка в имени переменной!"}, 400.0, st) == (False, "repeat")
+    assert p.accept({**d, "text": "Тесты прошли — отличная работа."}, 400.0, st)[0]
+    p.on_remark(500.0, "guard")                                 # a guard nudge also restarts the gap
+    assert p.accept({**d, "text": "Новая мысль"}, 520.0, st) == (False, "gap")
+    b1 = p.on_rate_limit(1000.0, 45.0, retry_after=None)
+    b2 = p.on_rate_limit(1000.0, 45.0, retry_after=None)
+    assert b2 > b1 and p.slow == 4.0 and p.due(1000.0 + b2 - 1, st) == (False, "backoff")
+    assert p.on_rate_limit(0.0, 45.0, daily=True) == 3600.0
+    p.on_success(); assert p.fail == 0 and p.slow < 8.0
+    lines = p.memory_lines(400.0)
+    assert lines and "Ты сказал" in lines[0]
+
+
+def test_live_prompt_and_parse():
+    from jarvis_app.live import build_prompt, parse_decision
+    st = normalize_settings({"assistant_name": "Пятница", "character_preset": "friend", "user_name": "Вова"})
+    sysp, up = build_prompt(st, task="физика", focus_phase="focus", title="TikTok", process="chrome.exe",
+                            fullscreen=True, since_remark=None, memory=["- 2 мин назад: код. Ты промолчал."])
+    assert "Ты — Пятница" in sysp and "Тёплый" in sysp and "Вова" in sysp and "МОЛЧИШЬ" in sysp
+    assert "физика" in up and "не используй nudge" in up and "весь экран" in up and "Ты промолчал" in up
+    _, up2 = build_prompt(st, since_remark=300)
+    assert "не запущена" in up2 and "5 мин назад" in up2
+    d = parse_decision('{"activity":"смотрит TikTok","reason":"залип","speak":true,"kind":"nudge","confidence":0.92,"text":"**Эй**, хватит листать!"}')
+    assert d["valid"] and d["speak"] and d["kind"] == "nudge" and d["text"] == "Эй, хватит листать!" and d["confidence"] == 0.92
+    d = parse_decision('мусор {"speak": "false", "kind": "weird", "confidence": 85} хвост')
+    assert d["valid"] and not d["speak"] and d["kind"] == "hint" and d["confidence"] == 0.85
+    assert not parse_decision("nope")["valid"]
+
+
+def test_fullscreen_and_calls():
+    from jarvis_app.watcher import covers_monitor, is_call
+    assert covers_monitor((0, 0, 1920, 1080), (0, 0, 1920, 1080))
+    assert covers_monitor((-8, -8, 1928, 1088), (0, 0, 1920, 1080))
+    assert not covers_monitor((0, 0, 1920, 1040), (0, 0, 1920, 1080))          # maximized, taskbar visible
+    assert covers_monitor((1920, 0, 4480, 1440), (1920, 0, 4480, 1440))        # second monitor
+    assert is_call("Zoom Meeting", "Zoom.exe") and is_call("Weekly sync | Microsoft Teams", "ms-teams.exe")
+    assert not is_call("main.py - Visual Studio Code", "Code.exe")
+
+
+def test_name_wake_matching():
+    from jarvis_app.namewake import name_variants, match_wake, lat_to_cyr, need_score
+    assert name_variants("Пятница") == ["пятница"]
+    assert "джарвис" in name_variants("Jarvis") and "джарвис" in name_variants("Джарвис")
+    assert lat_to_cyr("Friday") == "фрайдей" and lat_to_cyr("Kira") == "кира" and lat_to_cyr("Kaito") == "кайто"
+    assert name_variants("Airi")[0] == "айри"
+    assert name_variants("Мистер Робот") == ["мистер робот"]
+    W = lambda *ws: [{"word": w, "conf": c, "start": i * 0.5, "end": i * 0.5 + 0.4} for i, (w, c) in enumerate(ws)]
+    v = name_variants("Пятница")
+    assert match_wake(W(("пятница", 1.0)), v)
+    m = match_wake(W(("эй", 1.0), ("пятница", 1.0), ("открой", 1.0), ("телеграм", 1.0)), v)
+    assert m and [w["word"] for w in m["rest"]] == ["открой", "телеграм"] and abs(m["end"] - 0.9) < 1e-6
+    assert match_wake(W(("сегодня", 1.0), ("пятница", 1.0)), v) is None        # name not at the start
+    assert match_wake(W(("алиса", 1.0), ("поставь", 1.0)), v) is None
+    assert match_wake(W(("джервис", 0.78), ("сколько", 1.0)), name_variants("Джарвис"))   # close mishearing
+    assert match_wake(W(("мистер", 1.0), ("робот", 0.9)), name_variants("Мистер Робот"))
+    assert match_wake(W(("джарвис", 0.5)), name_variants("Джарвис"), threshold=0.95) is None   # 0.9 < 0.93
+    assert need_score(0.1) < need_score(0.5) < need_score(0.95)
+
+
+def test_live_tool_declared():
+    from jarvis_app.actions import TOOLS
+    t = [x for x in TOOLS if x["name"] == "set_live_mode"][0]
+    assert t["parameters"]["required"] == ["enabled"] and "следи и подсказывай" in t["description"]
+    class C:
+        def set_live(self, on): return {"ok": True, "live_mode": on}
+    a = Actions.__new__(Actions); a.core = C()
+    assert a.execute("set_live_mode", {"enabled": False}) == {"ok": True, "live_mode": False}
+    from jarvis_app.brain import build_system_prompt, SYSTEM_PROMPT
+    assert "set_live_mode" in SYSTEM_PROMPT
+
+
+def test_live_intent_fallback():
+    from jarvis_app.live import live_intent
+    on = ["Следи и подсказывай", "Включи живой режим", "включи, пожалуйста, живой режим", "живой режим вкл", "подсказывай мне"]
+    off = ["Хватит, выключи живой режим", "тихо, не мешай со своими подсказками", "отключи живой режим",
+           "хватит следить и подсказывать", "больше не подсказывай", "живой режим выкл"]
+    neutral = ["открой телеграм", "что такое живой режим?", "тихо", "хватит", "включи музыку", "сколько времени"]
+    for t in on: assert live_intent(t) is True, t
+    for t in off: assert live_intent(t) is False, t
+    for t in neutral: assert live_intent(t) is None, t
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:

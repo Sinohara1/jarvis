@@ -19,8 +19,9 @@ from . import persona
 from .config import load_settings, normalize_settings, register_secrets, save_settings
 from .focus import FocusSession, Stats, fmt_clock, minutes_phrase
 from .hotkey import Hotkey
-from .watcher import (Foreground, NudgePolicy, capture_screen_jpeg, get_foreground,
-                      match_distraction, nudge_text)
+from .live import LivePolicy, build_prompt, live_intent, talk_params
+from .watcher import (Foreground, NudgePolicy, capture_screen_jpeg, get_foreground, is_call,
+                      is_fullscreen, match_distraction, nudge_text)
 
 log = logging.getLogger("jarvis")
 
@@ -60,6 +61,17 @@ class JarvisCore:
         self._title_hit_until = 0.0
         self._episode_counted = False
         self.guard_status = "Страж ждёт фокус-сессию"
+        # live mode bookkeeping
+        self.live = LivePolicy()
+        self._live_inflight = False
+        self._live_fg_at = 0.0
+        self._live_fg = Foreground()
+        self._live_fullscreen = False
+        self.live_status = "Выключен"
+        self._wake_dl = False
+        if self.settings["live_mode"]:
+            self.live.reset(time.monotonic())
+            self.live_status = "Включён — присматриваюсь"
 
     # ── lifecycle ──
     def start(self) -> None:
@@ -97,9 +109,18 @@ class JarvisCore:
         self.policy.grace = self.settings["distraction_grace_sec"]
         if old["hotkey"] != self.settings["hotkey"]:
             self._apply_hotkey()
-        if (old["wake_word"] != self.settings["wake_word"]
-                or old["wake_threshold"] != self.settings["wake_threshold"]):
+        if old["wake_mode"] != self.settings["wake_mode"]:
             self._apply_wake()
+        elif self.wake is not None and self.settings["wake_mode"] == "name":
+            if old["assistant_name"] != self.settings["assistant_name"] and hasattr(self.wake, "set_name"):
+                self.wake.set_name(self.settings["assistant_name"])  # live, no restart
+                self._emit_wake()
+            if old["name_threshold"] != self.settings["name_threshold"] and hasattr(self.wake, "set_threshold"):
+                self.wake.set_threshold(self.settings["name_threshold"])
+        elif old["wake_threshold"] != self.settings["wake_threshold"] and self.settings["wake_mode"] == "hey_jarvis":
+            self._apply_wake()
+        if old["live_mode"] != self.settings["live_mode"]:
+            self._live_switched(self.settings["live_mode"])
         if old["provider"] != self.settings["provider"]:
             self.brain.reset()
         self._screen_backoff_until = 0.0
@@ -117,23 +138,72 @@ class JarvisCore:
         else:
             self.emit("error", text=f"Не удалось назначить горячую клавишу {self.settings['hotkey']}")
 
+    def wake_info(self, error: str | None = None) -> dict:
+        mode = self.settings["wake_mode"]
+        return {"enabled": self.wake is not None, "mode": mode, "error": error,
+                "downloading": self._wake_dl, "phrase": (persona.assistant_name(self.settings) if mode == "name"
+                                                         else "Hey Jarvis" if mode == "hey_jarvis" else "")}
+
+    def _emit_wake(self, error: str | None = None, **extra) -> None:
+        self.emit("wake", **self.wake_info(error), **extra)
+
     def _apply_wake(self) -> None:
         if self.wake:
             self.wake.stop()
             self.wake = None
-        if not self.settings["wake_word"]:
-            self.emit("wake", enabled=False, error=None)
+        mode = self.settings["wake_mode"]
+        if mode == "off":
+            self._emit_wake()
+            return
+        if mode == "name":
+            from . import namewake
+            path = namewake.find_model()
+            if not path:
+                if not self._wake_dl:
+                    self._wake_dl = True
+                    threading.Thread(target=self._download_vosk, name="vosk-download", daemon=True).start()
+                self._emit_wake()
+                return
+            try:
+                self.wake = namewake.NameWakeListener(self.mic, self.wake_detected, self.settings["assistant_name"],
+                                                      threshold=self.settings["name_threshold"], model_path=path)
+                self.wake.start()
+                threading.Thread(target=self._check_wake_started, args=(self.wake,), daemon=True).start()
+                self._emit_wake()
+            except Exception as e:
+                log.error("name wake unavailable: %s", e)
+                self.wake = None
+                self._emit_wake(str(e))
             return
         try:
             from .wakeword import WakeWordListener
             self.wake = WakeWordListener(self.mic, self.wake_detected,
                                          threshold=self.settings["wake_threshold"])
             self.wake.start()
-            self.emit("wake", enabled=True, error=None)
+            self._emit_wake()
         except Exception as e:
             log.error("wake word unavailable: %s", e)
             self.wake = None
-            self.emit("wake", enabled=False, error=str(e))
+            self._emit_wake(str(e))
+
+    def _check_wake_started(self, listener) -> None:
+        listener.ready.wait(30)
+        if listener.error and self.wake is listener:
+            self.wake = None
+            self._emit_wake(listener.error)
+
+    def _download_vosk(self) -> None:
+        from . import namewake
+        try:
+            log.info("downloading vosk model %s", namewake.VOSK_MODEL_URL)
+            namewake.download_model(lambda d, t: self.emit("wake_dl", done=d, total=t))
+            self._wake_dl = False
+            if self.settings["wake_mode"] == "name" and not self._stop.is_set():
+                self._apply_wake()
+        except Exception as e:
+            self._wake_dl = False
+            log.error("vosk model download failed: %s", e)
+            self._emit_wake(f"не удалось скачать модель распознавания: {e}")
 
     # ── state ──
     def set_state(self, st: str, detail: str = "") -> None:
@@ -180,27 +250,33 @@ class JarvisCore:
         self.speaker.stop()
         self._start_recording("auto")
 
-    def wake_detected(self) -> None:
+    def wake_detected(self, request_wav: bytes | None = None) -> None:
         if self._rec is not None or self.state == "thinking":
             return
         self.speaker.stop()
+        if request_wav:  # «Пятница, открой телеграм» in one breath: the request is already recorded
+            beep("listen")
+            self.set_state("thinking", "Распознаю…")
+            self._jobs.put(("audio", request_wav))
+            return
         self._start_recording("auto")
 
-    def _start_recording(self, mode: str) -> None:
+    def _start_recording(self, mode: str, no_speech_timeout: float | None = None) -> None:
         with self._rec_lock:
             if self._rec is not None:
                 return
-            rec = Recording(self.mic, auto_stop=(mode == "auto"),
-                            on_level=lambda lv: self.emit("level", level=lv))
+            kw = {"no_speech_timeout": float(no_speech_timeout)} if no_speech_timeout else {}
+            rec = Recording(self.mic, auto_stop=(mode in ("auto", "reply")),
+                            on_level=lambda lv: self.emit("level", level=lv), **kw)
             self._rec = rec
             self._rec_mode = mode
         if self.wake:
             self.wake.suspended.set()
         self.set_state("listening")
         beep("listen")
-        threading.Thread(target=self._record_thread, args=(rec,), name="recorder", daemon=True).start()
+        threading.Thread(target=self._record_thread, args=(rec, mode), name="recorder", daemon=True).start()
 
-    def _record_thread(self, rec: Recording) -> None:
+    def _record_thread(self, rec: Recording, mode: str = "") -> None:
         wav = None
         try:
             wav = rec.run()
@@ -217,7 +293,7 @@ class JarvisCore:
         if wav and rec.speech_detected:
             self._jobs.put(("audio", wav))
         else:
-            self.set_state("idle", "Не расслышал" if not rec.cancelled else "")
+            self.set_state("idle", "Не расслышал" if not rec.cancelled and mode != "reply" else "")
 
     def submit_text(self, text: str) -> None:
         t = (text or "").strip()
@@ -261,7 +337,18 @@ class JarvisCore:
 
     def _answer(self, text: str) -> None:
         self.set_state("thinking", "Думаю…")
-        reply = self.brain.ask(text, on_tool=lambda n, a: self.emit("tool", name=n, args=a))
+        tools_used = []
+
+        def on_tool(n, a):
+            tools_used.append(n)
+            self.emit("tool", name=n, args=a)
+
+        reply = self.brain.ask(text, on_tool=on_tool)
+        if "set_live_mode" not in tools_used:
+            want = live_intent(text)
+            if want is not None and bool(self.settings.get("live_mode")) != want:
+                log.info("live intent fallback: model did not call set_live_mode -> %s", want)
+                self.set_live(want)
         self.emit("chat", role="jarvis", text=reply)
         if self.settings["speak_replies"]:
             self.set_state("speaking")
@@ -397,7 +484,9 @@ class JarvisCore:
                 if ev:
                     self._on_phase(ev)
                 self._check_reminders()
-                self._guard_step(time.monotonic())
+                now = time.monotonic()
+                self._guard_step(now)
+                self._live_step(now)
             except Exception:
                 log.exception("ticker step failed")
             self._stop.wait(0.5)
@@ -478,8 +567,151 @@ class JarvisCore:
         left = minutes_phrase(max(1, int(self.session.remaining() // 60)))
         text = persona.nudge_text(self.settings, level, self.session.task, left=left)
         log.info("nudge level %d", level)
+        self.live.on_remark(now, "guard")
         beep("nudge")
         self.emit("chat", role="jarvis", text=text, kind="nudge")
         self.emit("notify", text=text)
         self.emit("focus")
         self.say(text)
+
+    # ── live mode (v1.2) ──
+    def set_live(self, on: bool) -> dict:
+        """Voice/text intent or UI toggle."""
+        if bool(self.settings["live_mode"]) != bool(on):
+            new = dict(self.settings)
+            new["live_mode"] = bool(on)
+            self.apply_settings(new)  # → _live_switched
+        p = talk_params(self.settings)
+        return {"ok": True, "live_mode": bool(on), "check_every_sec": int(p["interval"]),
+                "min_gap_min": round(p["gap"] / 60, 1),
+                "note": "буду иногда смотреть на экран и говорить, только когда это уместно" if on
+                        else "больше не буду сам комментировать экран"}
+
+    def _live_switched(self, on: bool) -> None:
+        self.live.reset(time.monotonic() if on else None)
+        self.live_status = "Включён — присматриваюсь" if on else "Выключен"
+        log.info("live mode %s", "on" if on else "off")
+        self.emit("live", status=self.live_status, enabled=on)
+
+    def _set_live_status(self, text: str) -> None:
+        if text != self.live_status:
+            self.live_status = text
+            self.emit("live", status=text, enabled=self.settings["live_mode"])
+
+    def _live_step(self, now: float) -> None:
+        s = self.settings
+        if not s["live_mode"] or self._live_inflight:
+            return
+        if now - self._live_fg_at >= 2.0:  # cheap local checks every 2 s
+            self._live_fg_at = now
+            fg = get_foreground()
+            self._live_fg = fg
+            self._live_fullscreen = is_fullscreen(fg)
+            if fg.pid != os.getpid():
+                self.live.note_foreground((fg.process.lower(), fg.title), now)
+        fg = self._live_fg
+        if fg.pid and fg.pid == os.getpid():
+            return  # he is looking at Jarvis itself
+        if self.state != "idle" or self._rec is not None or self.speaker.speaking:
+            return
+        if is_call(fg.title, fg.process):
+            self._set_live_status("Молчу: идёт звонок")
+            return
+        in_focus = self.session.in_focus
+        distraction = match_distraction(fg.title, fg.process, s["distractions"])
+        if self._live_fullscreen and not distraction:
+            self._set_live_status("Молчу: полноэкранное приложение")
+            return
+        if self._live_fullscreen and in_focus:
+            return  # a fullscreen distraction during focus is the guard's job
+        ok, why = self.live.due(now, s, in_focus=in_focus)
+        if not ok:
+            if why == "gap":
+                left = self.live.gap_left(now, s, in_focus=in_focus)
+                self._set_live_status(f"Пауза после реплики: {max(1, int(left // 60) + (1 if left % 60 else 0))} мин")
+            elif why in ("settle", "change") and not self.live_status.startswith("Лимит"):
+                self._set_live_status("Присматриваюсь…")
+            return
+        self.live.on_check(now)
+        self._live_inflight = True
+        threading.Thread(target=self._live_check, args=(fg, self._live_fullscreen, in_focus),
+                         name="live-check", daemon=True).start()
+
+    def _live_check(self, fg: Foreground, fullscreen: bool, in_focus: bool) -> None:
+        s = self.settings
+        try:
+            jpeg = capture_screen_jpeg(max_side=1024, quality=60)
+            if not jpeg:
+                self._set_live_status("Не удалось сделать снимок экрана")
+                return
+            now = time.monotonic()
+            snap = self.session.snapshot()
+            since = None if self.live.last_remark is None else now - self.live.last_remark
+            system, prompt = build_prompt(s, task=snap["task"], focus_phase=snap["phase"], title=fg.title,
+                                          process=fg.process, fullscreen=fullscreen, since_remark=since,
+                                          memory=self.live.memory_lines(now))
+            d = self.brain.live_decide(jpeg, system, prompt)
+            del jpeg  # memory only, never saved
+            self.live.on_success()
+            now = time.monotonic()
+            ok, why = self.live.accept(d, now, self.settings, in_focus=self.session.in_focus)
+            stamp = datetime.now().strftime("%H:%M")
+            # the world may have moved on while the model was thinking
+            if ok and (not self.settings["live_mode"] or self.state != "idle" or self._rec is not None
+                       or self.speaker.speaking):
+                ok, why = False, "busy"
+            cur = get_foreground()
+            if ok and cur.pid != os.getpid() and (cur.process.lower(), cur.title) != (fg.process.lower(), fg.title):
+                ok, why = False, "change"
+            log.info("live: speak=%s kind=%s conf=%.2f -> %s (%s) | %s", d["speak"], d["kind"], d["confidence"],
+                     "SAY" if ok else "skip", why or "ok", d["reason"][:120])
+            if not ok:
+                self.live.remember(now, d["activity"], fg.title, silent_reason=why or d["reason"])
+                self._set_live_status(f"{stamp} посмотрел — молчу" + (f" ({d['activity']})" if d["activity"] else ""))
+                return
+            self.live.remember(now, d["activity"], fg.title, said=d["text"], kind=d["kind"])
+            self.live.on_remark(now, "live")
+            self._set_live_status(f"{stamp} сказал: {d['text'][:60]}")
+            self._live_say(d)
+        except P.RateLimitError as e:
+            back = self.live.on_rate_limit(time.monotonic(), talk_params(s)["interval"], e.retry_after, e.daily)
+            self._set_live_status(f"Лимит API: живой режим на паузе {max(1, int(back // 60))} мин и смотрит реже")
+            log.info("live: rate limited, pause %.0fs, slow x%.1f", back, self.live.slow)
+        except P.NoKeyError:
+            self.live.backoff_until = time.monotonic() + 600
+            self._set_live_status("Нет API-ключа — живому режиму нечем думать")
+        except Exception as e:
+            back = self.live.on_error(time.monotonic())
+            log.warning("live check failed: %s", e)
+            self._set_live_status(f"Ошибка, повторю через {int(back)} с")
+        finally:
+            self._live_inflight = False
+
+    def _live_say(self, d: dict) -> None:
+        text = d["text"]
+        kind = d["kind"]
+        self.emit("chat", role="jarvis", text=text, kind="live", live_kind=kind)
+        self.emit("notify", text=text)
+        try:
+            self.brain.note_remark(text)
+        except Exception:
+            log.exception("note_remark failed")
+        if not self.settings["speak_replies"]:
+            return
+        beep("phase" if kind != "nudge" else "nudge")
+        self.say(text)
+        reply = self.settings["live_reply_sec"]
+        if kind == "question" and reply > 0:
+            threading.Thread(target=self._await_reply, args=(reply,), name="live-reply", daemon=True).start()
+
+    def _await_reply(self, seconds: int) -> None:
+        """After a spoken question: once the voice finishes, listen briefly so he can just answer."""
+        t0 = time.monotonic()
+        while not self.speaker.speaking and time.monotonic() - t0 < 5:
+            time.sleep(0.1)
+        while self.speaker.speaking and time.monotonic() - t0 < 60:
+            time.sleep(0.2)
+        time.sleep(0.3)
+        if self.state in ("idle", "speaking") and self._rec is None and not self.speaker.speaking:
+            log.info("live: listening %ds for a reply", seconds)
+            self._start_recording("reply", no_speech_timeout=seconds)

@@ -36,6 +36,8 @@ if IS_WIN:
                     ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
     _user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 
 
 @dataclass
@@ -93,6 +95,64 @@ def match_distraction(title: str, process: str, patterns: list[str],
         if p in hay_t or p in hay_p:
             return pat
     return None
+
+
+# ─── Fullscreen / calls (live mode etiquette) ────────────────────────────────
+
+SHELL_CLASSES = {"progman", "workerw", "shell_traywnd", "shell_secondarytraywnd"}
+CALL_PROCS = {"zoom.exe", "teams.exe", "ms-teams.exe", "skype.exe", "webex.exe", "ciscowebexstart.exe"}
+CALL_TITLES = ("zoom meeting", "zoom-конференция", "конференция zoom", "google meet", "meet - ", "microsoft teams meeting",
+               "собрание | microsoft teams", "звонок", "call with", "видеозвонок")
+
+
+def covers_monitor(win: tuple[int, int, int, int], mon: tuple[int, int, int, int], tol: int = 2) -> bool:
+    """True when a window rect covers the whole monitor rect (borderless fullscreen or exclusive)."""
+    return (win[0] <= mon[0] + tol and win[1] <= mon[1] + tol
+            and win[2] >= mon[2] - tol and win[3] >= mon[3] - tol)
+
+
+def is_fullscreen(fg: Foreground) -> bool:
+    """Foreground window fills its monitor (games, fullscreen video). Desktop/taskbar don't count."""
+    if not IS_WIN or not fg.hwnd:
+        return False
+    old = None
+    try:
+        try:
+            _user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            _user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            old = _user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            old = None
+        hwnd = wintypes.HWND(fg.hwnd)
+        cls = ctypes.create_unicode_buffer(128)
+        _user32.GetClassNameW(hwnd, cls, 128)
+        if cls.value.lower() in SHELL_CLASSES:
+            return False
+        r = wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return False
+        mon = _user32.MonitorFromWindow(hwnd, 2)
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not _user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            return False
+        m = mi.rcMonitor
+        return covers_monitor((r.left, r.top, r.right, r.bottom), (m.left, m.top, m.right, m.bottom))
+    except Exception:
+        return False
+    finally:
+        if old:
+            try:
+                _user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(old))
+            except Exception:
+                pass
+
+
+def is_call(title: str, process: str) -> bool:
+    """Video/voice call in the foreground — the assistant should not chime in."""
+    p = (process or "").lower()
+    t = (title or "").lower()
+    return p in CALL_PROCS or any(x in t for x in CALL_TITLES)
 
 
 # ─── Screenshot ──────────────────────────────────────────────────────────────
