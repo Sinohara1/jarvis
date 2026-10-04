@@ -23,6 +23,20 @@ if (-not (Test-Path -LiteralPath "jarvis.ico")) {
     & $Py -c "import sys; sys.path.insert(0, '.'); from jarvis_app.tray import make_icon_image as m; m(256).save('jarvis.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])"
 }
 
+# Piper (local TTS): bundle only the espeak-ng data needed for Russian (+ English words), ~10 MB instead of 20.
+$PiperPkg = (& $Py -c "import piper, os; print(os.path.dirname(piper.__file__))").Trim()
+if ($LASTEXITCODE -ne 0 -or -not $PiperPkg) { throw "piper-tts is not installed in .venv (pip install -r requirements.txt)" }
+$EspeakSrc = Join-Path $PiperPkg "espeak-ng-data"
+$EspeakDst = Join-Path $ProjectDir "build_assets\piper_espeak\espeak-ng-data"
+if (Test-Path -LiteralPath $EspeakDst) { Remove-Item -LiteralPath $EspeakDst -Recurse -Force }
+New-Item -ItemType Directory -Force -Path (Join-Path $EspeakDst "lang") | Out-Null
+foreach ($f in @("phondata", "phonindex", "phontab", "intonations", "ru_dict", "en_dict")) {
+    Copy-Item -LiteralPath (Join-Path $EspeakSrc $f) -Destination $EspeakDst
+}
+foreach ($d in @("zle", "gmw")) {
+    Copy-Item -LiteralPath (Join-Path $EspeakSrc "lang\$d") -Destination (Join-Path $EspeakDst "lang") -Recurse
+}
+
 & $Py -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name Jarvis `
     --icon jarvis.ico `
@@ -31,6 +45,11 @@ if (-not (Test-Path -LiteralPath "jarvis.ico")) {
     --hidden-import pystray._win32 `
     --hidden-import clr `
     --collect-all vosk `
+    --add-data "build_assets\piper_espeak\espeak-ng-data;piper_data\espeak-ng-data" `
+    --hidden-import piper.espeakbridge `
+    --exclude-module piper.train --exclude-module piper.http_server --exclude-module onnx `
+    --exclude-module piper.phonemize_chinese --exclude-module piper.phonemize_japanese `
+    --exclude-module piper.phonemize_thai --exclude-module piper.phonemize_hebrew --exclude-module piper.g2pw_onnx `
     --exclude-module matplotlib --exclude-module scipy --exclude-module pandas `
     --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide6 --exclude-module gi `
     jarvis.pyw

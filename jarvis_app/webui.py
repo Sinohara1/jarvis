@@ -248,7 +248,8 @@ class Bridge:
             "wake": c.wake_info(), "maximized": self._frame.maximized,
             "live": {"enabled": bool(s["live_mode"]), "status": c.live_status},
             "has_key": bool(api_key_for(s, prov)), "data_dir": DATA_DIR,
-            "presets": persona.presets_payload(),
+            "presets": persona.presets_payload(), "tts": c.tts_info(),
+            "lite_model": c.brain.models()[1],
         }
         self._ready.set()
         log.info("UI connected (js init)")
@@ -343,9 +344,26 @@ class Bridge:
             from .providers import friendly_error
             return friendly_error(e)
 
-    def test_voice(self, voice: str = "", rate: int | None = None, volume: int | None = None) -> None:
+    def tts_info(self) -> dict:
+        return self._core.tts_info()
+
+    def download_voice(self, key: str) -> dict:
+        ok = self._core.download_voice(str(key or ""))
+        return {"ok": ok, "tts": self._core.tts_info()}
+
+    def test_voice(self, voice: str = "", rate: int | None = None, volume: int | None = None,
+                   engine: str = "", piper_voice: str = "") -> dict:
+        """Preview. Local voice not downloaded yet → start the download and report it."""
+        from . import tts_local
         sp = self._core.speaker
         tmp = copy.deepcopy(self._core.settings)
+        if engine in ("piper", "edge"):
+            tmp["tts_engine"] = engine
+        if piper_voice:
+            tmp["piper_voice"] = piper_voice
+        if tmp["tts_engine"] == "piper" and not tts_local.installed(tmp["piper_voice"]):
+            self._core.download_voice(tmp["piper_voice"])
+            return {"ok": False, "downloading": tmp["piper_voice"], "tts": self._core.tts_info()}
         if voice:
             tmp["voice"] = voice
         if rate is not None:
@@ -360,6 +378,7 @@ class Bridge:
             time.sleep(10)
             sp.get_settings = lambda: self._core.settings
         threading.Thread(target=restore, daemon=True).start()
+        return {"ok": True, "engine": sp.engine_for(tmp)}
 
     # focus
     def focus_start(self, task: str, minutes=None, rounds=None, break_minutes=None) -> dict:

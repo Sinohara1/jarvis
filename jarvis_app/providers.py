@@ -12,6 +12,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Iterator
 
 import requests
 
@@ -179,6 +180,15 @@ class Provider:
              *, timeout: float = 40.0, temperature: float = 0.7) -> LLMResult:
         raise NotImplementedError
 
+    def chat_stream(self, model: str, system: str, messages: list, tools: list[dict] | None = None,
+                    *, on_text, timeout: float = 40.0, temperature: float = 0.7,
+                    max_tokens: int = 2048) -> LLMResult:
+        """Like chat(), but on_text(delta) is called as text arrives. Default: no streaming."""
+        res = self.chat(model, system, messages, tools, timeout=timeout, temperature=temperature)
+        if res.text:
+            on_text(res.text)
+        return res
+
     def generate(self, model: str, prompt: str, *, image_jpeg: bytes | None = None,
                  audio_wav: bytes | None = None, json_schema: dict | None = None,
                  system: str | None = None, timeout: float = 40.0,
@@ -266,6 +276,39 @@ class GeminiProvider(Provider):
                      timeout=timeout, provider="gemini")
         return self._parse(data, model)
 
+    def chat_stream(self, model, system, messages, tools=None, *, on_text, timeout=40.0, temperature=0.7,
+                    max_tokens=2048):
+        """streamGenerateContent (SSE): text deltas go to on_text immediately; tool calls and the
+        full model message (with thought signatures) are returned like chat()."""
+        payload: dict = {
+            "contents": messages,
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        t = self._tools(tools)
+        if t:
+            payload["tools"] = t
+        url = self._url(model).replace(":generateContent", ":streamGenerateContent") + "?alt=sse"
+        try:
+            resp = self.session.post(url, headers=self._headers(), json=payload, timeout=(6.0, timeout), stream=True)
+        except requests.Timeout as e:
+            raise OverloadedError("Сервис не ответил вовремя", detail=str(e)) from e
+        except requests.RequestException as e:
+            raise ProviderError("Нет связи с сервисом", detail=str(e)[:300]) from e
+        with resp:
+            raise_for_response(resp, "gemini")
+            acc = StreamAccumulator(model)
+            try:
+                for data in iter_sse(resp):
+                    for delta in acc.add(data):
+                        on_text(delta)
+            except requests.RequestException as e:
+                if not acc.got_any:
+                    raise OverloadedError("Обрыв связи с сервисом", detail=str(e)[:300]) from e
+                raise ProviderError("Обрыв связи с сервисом", detail=str(e)[:300]) from e
+        return acc.result()
+
     def generate(self, model, prompt, *, image_jpeg=None, audio_wav=None, json_schema=None,
                  system=None, timeout=40.0, temperature=0.2, max_tokens=1024):
         parts: list[dict] = []
@@ -296,6 +339,113 @@ class GeminiProvider(Provider):
         text = self.generate(model, prompt, audio_wav=wav, timeout=timeout,
                              temperature=0.0, max_tokens=800)
         return clean_transcript(text)
+
+
+def iter_sse(resp) -> Iterator[dict]:
+    """Parse a Server-Sent Events body into JSON objects. Splits on raw b"\n" (str.splitlines would
+    also split on U+2028 etc. inside Russian text)."""
+    buf = b""
+    data_lines: list[bytes] = []
+    for chunk in resp.iter_content(chunk_size=None):
+        if not chunk:
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if not line:
+                if data_lines:
+                    yield from _sse_event(data_lines)
+                    data_lines = []
+                continue
+            if line.startswith(b"data:"):
+                data_lines.append(line[5:].lstrip())
+    if buf.strip().startswith(b"data:"):
+        data_lines.append(buf.strip()[5:].lstrip())
+    if data_lines:
+        yield from _sse_event(data_lines)
+
+
+def _sse_event(lines: list[bytes]):
+    raw = b"\n".join(lines).decode("utf-8", "replace").strip()
+    if not raw or raw == "[DONE]":
+        return
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        log.debug("bad SSE chunk: %r", raw[:200])
+        return
+    if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
+        err = obj["error"]
+        code = int(err.get("code") or 0)
+        msg = str(err.get("message", ""))[:400]
+        if code == 429:
+            raise RateLimitError("Лимит запросов", retry_after=parse_retry_after(None, obj),
+                                 daily=_is_daily_quota(obj), detail=msg)
+        if code in (500, 502, 503, 504):
+            raise OverloadedError("Сервис перегружен", status=code, detail=msg)
+        raise ProviderError("Ошибка запроса", status=code or None, detail=msg)
+    yield obj
+
+
+class StreamAccumulator:
+    """Collects Gemini stream chunks into one LLMResult; add() returns new visible text deltas."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.parts: list[dict] = []
+        self.texts: list[str] = []
+        self.calls: list[ToolCall] = []
+        self.got_any = False
+        self.model_version = ""
+        self.blocked = ""
+
+    def add(self, data: dict) -> list[str]:
+        out: list[str] = []
+        self.model_version = str(data.get("modelVersion") or self.model_version)
+        cands = data.get("candidates") or []
+        if not cands:
+            fb = data.get("promptFeedback") or {}
+            if fb.get("blockReason"):
+                self.blocked = json.dumps(fb)[:300]
+            return out
+        for p in (cands[0].get("content") or {}).get("parts") or []:
+            if not isinstance(p, dict):
+                continue
+            self.got_any = True
+            if "functionCall" in p:
+                fc = p["functionCall"] or {}
+                self.calls.append(ToolCall(id=str(fc.get("id") or f"local-{len(self.parts)}"),
+                                           name=str(fc.get("name", "")), args=dict(fc.get("args") or {})))
+                self.parts.append(p)
+                if self.texts and len(self.calls) == 1:
+                    out.append("\n")  # text before a tool call is complete: let the caller speak it now
+            elif p.get("thought"):
+                continue
+            elif "text" in p:
+                txt = p.get("text") or ""
+                if txt:
+                    self.texts.append(txt)
+                    out.append(txt)
+                # merge consecutive text parts; keep a thought signature if one arrives
+                if self.parts and "text" in self.parts[-1] and "functionCall" not in self.parts[-1]:
+                    last = self.parts[-1]
+                    last["text"] = (last.get("text") or "") + txt
+                    if p.get("thoughtSignature") and not last.get("thoughtSignature"):
+                        last["thoughtSignature"] = p["thoughtSignature"]
+                else:
+                    self.parts.append(dict(p))
+            elif p.get("thoughtSignature"):
+                self.parts.append(p)
+        return out
+
+    def result(self) -> LLMResult:
+        if not self.got_any:
+            raise ProviderError("Пустой ответ модели", detail=self.blocked)
+        parts = [p for p in self.parts if not ("text" in p and not p.get("text") and not p.get("thoughtSignature"))]
+        raw = {"role": "model", "parts": parts} if parts else None
+        return LLMResult(text="".join(self.texts).strip(), tool_calls=self.calls, raw_message=raw,
+                         model=self.model_version or self.model)
 
 
 # ─── OpenAI-compatible (OpenAI, xAI) ─────────────────────────────────────────

@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import threading
 
@@ -136,7 +137,13 @@ DEFAULT_SETTINGS: dict = {
     "models": {p: {"chat": d["chat"], "lite": d["lite"]} for p, d in PROVIDERS.items()},
     "api_keys": {p: "" for p in PROVIDERS},
     "base_urls": {p: d["base_url"] for p, d in PROVIDERS.items()},
-    "voice": "ru-RU-DmitryNeural",
+    "voice": "ru-RU-DmitryNeural",   # edge-tts voice (online engine)
+    # v1.3 fast voice
+    "tts_engine": "piper",           # "piper" (local, offline, fast) | "edge" (Microsoft Edge, online)
+    "piper_voice": "ru_RU-dmitri-medium",
+    "stt_mode": "local",             # "local" (Vosk while you speak) | "cloud" (audio → Gemini)
+    "fast_replies": True,            # voice turns use the lite model (typed chat keeps the chat model)
+    "vad_silence_ms": 600,           # pause that ends a voice request (80 ms steps → ~0.64 s)
     "tts_rate": 5,          # percent, -50..+50
     "tts_volume": 85,       # 0..100
     "speak_replies": True,
@@ -173,6 +180,8 @@ DEFAULT_SETTINGS: dict = {
 }
 
 WAKE_MODES = ("name", "hey_jarvis", "off")
+TTS_ENGINES = ("piper", "edge")
+STT_MODES = ("local", "cloud")
 LIVE_TALK = ("rare", "some", "often")
 
 
@@ -259,6 +268,14 @@ def normalize_settings(raw: dict) -> dict:
     s["custom_commands"] = out
     s["hotkey"] = str(s.get("hotkey") or "ctrl+alt+j").strip().lower()
     s["voice"] = str(s.get("voice") or "ru-RU-DmitryNeural").strip()
+    if s.get("tts_engine") not in TTS_ENGINES:
+        s["tts_engine"] = "piper"
+    if s.get("stt_mode") not in STT_MODES:
+        s["stt_mode"] = "local"
+    pv = str(s.get("piper_voice") or "").strip()
+    s["piper_voice"] = pv if re.fullmatch(r"[a-z]{2}_[A-Z]{2}-[a-z0-9_]+-(x_low|low|medium|high)", pv) else "ru_RU-dmitri-medium"
+    s["fast_replies"] = bool(s.get("fast_replies"))
+    s["vad_silence_ms"] = _clamp_int(s.get("vad_silence_ms"), 400, 2000, 600)
     return s
 
 

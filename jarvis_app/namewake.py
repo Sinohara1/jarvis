@@ -195,7 +195,7 @@ class NameSpotter:
     Mic-free so it can be tested with WAV files."""
 
     PREROLL = 4        # chunks (~320 ms) fed when speech starts
-    HANG = 14          # chunks (~1.1 s) of trailing silence still fed → lets Vosk endpoint
+    HANG = 9           # chunks (~0.7 s) of trailing silence → utterance is final (was 14 ≈ 1.1 s in 1.2)
     MIN_LEVEL = 320.0
     KEEP_SEC = 25.0
 
@@ -278,16 +278,20 @@ class NameSpotter:
             a, b = max(0, a), min(self.audio.size, max(b, a))
             if b - a >= int(0.35 * SAMPLE_RATE):
                 req = pcm_to_wav(self.audio[a:b].tobytes())
+        last_end = float((rest or [{"end": m["end"]}])[-1].get("end", m["end"]))
+        from .stt_local import words_conf, words_text
         return {"score": m["score"], "heard": m["heard"], "request_wav": req,
-                "rest_text": " ".join(w["word"] for w in rest)}
+                "rest_text": " ".join(w["word"] for w in rest), "request_text": words_text(rest),
+                "request_conf": round(words_conf(rest), 3),
+                "lag": max(0.0, self.fed / SAMPLE_RATE - last_end)}  # seconds since the last word ended
 
 
 class NameWakeListener:
-    """Background thread: MicHub → NameSpotter → on_detect(request_wav or None).
+    """Background thread: MicHub → NameSpotter → on_detect(request_wav or None, detection dict).
     Same interface as WakeWordListener (suspended / start / stop) plus set_name()."""
 
     def __init__(self, hub, on_detect, name: str, threshold: float = 0.5, model_path: str | None = None,
-                 debounce: float = 2.0) -> None:
+                 debounce: float = 2.0, hang_sec: float | None = None) -> None:
         self.hub = hub
         self.on_detect = on_detect
         self.threshold = threshold
@@ -300,6 +304,12 @@ class NameWakeListener:
         self._spotter: NameSpotter | None = None
         self.error: str | None = None
         self.ready = threading.Event()
+        self.hang_sec = hang_sec
+
+    def set_hang(self, sec: float) -> None:
+        self.hang_sec = sec
+        if self._spotter is not None:
+            self._spotter.HANG = max(5, int(round(sec / 0.08)) + 1)
 
     def set_name(self, name: str) -> None:
         self.variants = name_variants(name)
@@ -324,13 +334,14 @@ class NameWakeListener:
 
     def _run(self) -> None:
         try:
-            import vosk
-            vosk.SetLogLevel(-1)
+            from .stt_local import get_model
             path = self.model_path or find_model()
             if not path:
                 raise RuntimeError("модель распознавания не скачана")
-            model = vosk.Model(path)
+            model = get_model(path)  # shared with local dictation
             self._spotter = NameSpotter(model, self.variants, self.threshold)
+            if self.hang_sec:
+                self._spotter.HANG = max(5, int(round(self.hang_sec / 0.08)) + 1)
             sid, q = self.hub.subscribe()
         except Exception as e:
             self.error = str(e)
@@ -366,8 +377,9 @@ class NameWakeListener:
                     log.info("name wake: «%s» score %.2f%s", det["heard"], det["score"],
                              " + request in the same breath" if det["request_wav"] else "")
                     sp.reset()
+                    det["t_speech_end"] = now - det.get("lag", 0.0)
                     try:
-                        self.on_detect(det["request_wav"])
+                        self.on_detect(det["request_wav"], det)
                     except Exception:
                         log.exception("name wake handler failed")
         finally:

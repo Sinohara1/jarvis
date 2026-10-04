@@ -13,8 +13,9 @@ from datetime import datetime
 
 from . import providers as P
 from .actions import Actions
-from .audio import MicHub, Recording, Speaker, beep
-from .brain import Brain, context_line
+from .audio import MicHub, Recording, SentenceSplitter, Speaker, VoiceTurn, beep
+from .brain import Brain, TurnCancelled, context_line
+from . import stt_local, tts_local
 from . import persona
 from .config import load_settings, normalize_settings, register_secrets, save_settings
 from .focus import FocusSession, Stats, fmt_clock, minutes_phrase
@@ -25,6 +26,19 @@ from .watcher import (Foreground, NudgePolicy, capture_screen_jpeg, get_foregrou
 
 log = logging.getLogger("jarvis")
 
+# Spoken right away when the model calls a tool before saying anything (voice turns): the tool + the
+# second model round take ~1 s more, the user should hear that we are on it.
+TOOL_ACK = {"open_app": "Открываю.", "open_url": "Открываю.", "open_path": "Открываю.", "web_search": "Ищу.",
+            "find_files": "Ищу файлы.", "start_focus": "Запускаю фокус.", "stop_focus": "Останавливаю.",
+            "set_reminder": "Ставлю напоминание.", "cancel_reminders": "Отменяю.", "look_at_screen": "Смотрю на экран."}
+
+
+def _same_ack(sentence: str, ack: str) -> bool:
+    """«Открываю ютуб.» right after our own «Открываю.» would sound like a stutter."""
+    w = sentence.lower().split()
+    a = ack.lower().split()
+    return bool(w and a) and len(w) <= 5 and w[0][:5] == a[0][:5]
+
 
 class JarvisCore:
     def __init__(self, emit) -> None:
@@ -34,7 +48,14 @@ class JarvisCore:
         self.stats = Stats()
         self.session = FocusSession()
         self.mic = MicHub()
-        self.speaker = Speaker(lambda: self.settings, on_state=self._on_speaking)
+        self.piper = tts_local.PiperTTS()
+        self.speaker = Speaker(lambda: self.settings, on_state=self._on_speaking, on_turn=self._on_turn,
+                               piper=self.piper)
+        self._turn: VoiceTurn | None = None
+        self._answering = False
+        self._piper_dl: str | None = None
+        self._piper_err: str | None = None
+        self.last_timing: dict | None = None
         self.actions = Actions(self)
         self.brain = Brain(lambda: self.settings, self.actions, self._context)
         self.policy = NudgePolicy(cooldown=self.settings["nudge_cooldown_sec"],
@@ -79,8 +100,84 @@ class JarvisCore:
         threading.Thread(target=self._ticker, name="ticker", daemon=True).start()
         self._apply_hotkey()
         self._apply_wake()
+        threading.Thread(target=self._prepare_voice, name="voice-prepare", daemon=True).start()
         log.info("core started; provider=%s chat=%s lite=%s", self.settings["provider"],
                  *self.brain.models())
+
+    # ── fast voice (v1.3): local TTS + local STT preparation ──
+    def _prepare_voice(self) -> None:
+        """Warm up what the next voice turn needs, so the first answer is not slower than the rest."""
+        s = self.settings
+        if s["tts_engine"] == "piper":
+            self.ensure_piper_voice(s["piper_voice"])
+        if s["stt_mode"] == "local":
+            self._ensure_stt_model()
+
+    def ensure_piper_voice(self, key: str) -> None:
+        if not tts_local.available():
+            self._piper_err = "движок Piper не найден в сборке"
+            return
+        if tts_local.installed(key):
+            try:
+                self.piper.load(key)
+            except Exception as e:
+                self._piper_err = f"не удалось загрузить голос: {e}"
+                log.exception("piper load failed")
+            self._emit_tts()
+            return
+        self.download_voice(key)
+
+    def download_voice(self, key: str) -> bool:
+        if key not in tts_local.PIPER_VOICES:
+            return False
+        if self._piper_dl:
+            return self._piper_dl == key
+        self._piper_dl, self._piper_err = key, None
+        self._emit_tts()
+
+        def work() -> None:
+            try:
+                log.info("downloading piper voice %s", key)
+                tts_local.download_voice(key, lambda d, t: self.emit("tts_dl", key=key, done=d, total=t))
+                self._piper_dl = None
+                if self.settings["piper_voice"] == key and self.settings["tts_engine"] == "piper":
+                    self.piper.load(key)
+            except Exception as e:
+                self._piper_dl = None
+                self._piper_err = f"не удалось скачать голос: {e}"
+                log.error("piper voice download failed: %s", e)
+            self._emit_tts()
+        threading.Thread(target=work, name="piper-download", daemon=True).start()
+        return True
+
+    def tts_info(self) -> dict:
+        s = self.settings
+        return {"engine": s["tts_engine"], "voice": s["piper_voice"], "voices": tts_local.voices_payload(),
+                "downloading": self._piper_dl, "error": self._piper_err, "available": tts_local.available(),
+                "active": self.speaker.engine_for(s), "stt": self.stt_info(), "timing": self.last_timing}
+
+    def _emit_tts(self) -> None:
+        self.emit("tts", **self.tts_info())
+
+    def stt_info(self) -> dict:
+        from . import namewake
+        return {"mode": self.settings["stt_mode"], "model": bool(namewake.find_model()),
+                "loaded": stt_local.is_loaded(), "downloading": self._wake_dl}
+
+    def _ensure_stt_model(self) -> None:
+        path = stt_local.model_path()
+        if path:
+            try:
+                t0 = time.monotonic()
+                stt_local.get_model(path)
+                log.info("local stt model ready in %.2fs", time.monotonic() - t0)
+            except Exception as e:
+                log.error("local stt model load failed: %s", e)
+            return
+        if not self._wake_dl:
+            self._wake_dl = True
+            threading.Thread(target=self._download_vosk, name="vosk-download", daemon=True).start()
+            self._emit_wake()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -123,6 +220,13 @@ class JarvisCore:
             self._live_switched(self.settings["live_mode"])
         if old["provider"] != self.settings["provider"]:
             self.brain.reset()
+        s = self.settings
+        if s["tts_engine"] == "piper" and (old["piper_voice"] != s["piper_voice"] or old["tts_engine"] != "piper"):
+            threading.Thread(target=self.ensure_piper_voice, args=(s["piper_voice"],), daemon=True).start()
+        if s["stt_mode"] == "local" and old["stt_mode"] != "local":
+            threading.Thread(target=self._ensure_stt_model, daemon=True).start()
+        if old["vad_silence_ms"] != s["vad_silence_ms"] and self.wake is not None and hasattr(self.wake, "set_hang"):
+            self.wake.set_hang(s["vad_silence_ms"] / 1000.0)
         self._screen_backoff_until = 0.0
         self._screen_fail = 0
         log.info("settings applied; provider=%s chat=%s lite=%s", self.settings["provider"],
@@ -166,7 +270,8 @@ class JarvisCore:
                 return
             try:
                 self.wake = namewake.NameWakeListener(self.mic, self.wake_detected, self.settings["assistant_name"],
-                                                      threshold=self.settings["name_threshold"], model_path=path)
+                                                      threshold=self.settings["name_threshold"], model_path=path,
+                                                      hang_sec=self.settings["vad_silence_ms"] / 1000.0)
                 self.wake.start()
                 threading.Thread(target=self._check_wake_started, args=(self.wake,), daemon=True).start()
                 self._emit_wake()
@@ -200,6 +305,11 @@ class JarvisCore:
             self._wake_dl = False
             if self.settings["wake_mode"] == "name" and not self._stop.is_set():
                 self._apply_wake()
+            else:
+                self._emit_wake()
+            if self.settings["stt_mode"] == "local":
+                self._ensure_stt_model()
+            self._emit_tts()
         except Exception as e:
             self._wake_dl = False
             log.error("vosk model download failed: %s", e)
@@ -219,8 +329,30 @@ class JarvisCore:
         if speaking:
             if self.state != "listening":
                 self.set_state("speaking")
-        elif self.state == "speaking":
+        elif self.state == "speaking" or (self.state == "thinking" and not self._answering):
             self.set_state("idle")
+
+    def _on_turn(self, turn: VoiceTurn) -> None:
+        """First audio of a reply started: log the latency breakdown."""
+        bd = turn.breakdown()
+        bd["source"] = turn.source
+        bd["engine"] = self.speaker.last_engine
+        if turn.source == "voice":
+            self.last_timing = bd
+        log.info("voice timing [%s, stt=%s, tts=%s, %s]: endpoint %s + stt %s + llm first token %s "
+                 "(first sentence %s) + tts %s + play %s = %s s from end of speech to first sound "
+                 "(text→sound %s s)", turn.source, bd["stt_mode"] or "-", bd["engine"], bd["model"] or "-",
+                 bd["endpoint"], bd["stt"], bd["llm_first"], bd["first_sentence"], bd["tts"], bd["play"],
+                 bd["first_audio"], bd["text_to_audio"])
+        if turn.source == "voice":
+            self.emit("voice_timing", **bd)
+
+    def _interrupt(self) -> None:
+        """New request / stop: silence now and abort a reply that is still streaming."""
+        self.speaker.stop()
+        t = self._turn
+        if t is not None:
+            t.cancelled = True
 
     # ── voice input ──
     def hotkey_down(self) -> None:
@@ -228,7 +360,7 @@ class JarvisCore:
             if self._rec is not None:
                 self._rec.stop()  # second press ends a toggle-mode recording
                 return
-        self.speaker.stop()
+        self._interrupt()
         self._start_recording("hold")
 
     def hotkey_up(self, held: float) -> None:
@@ -247,17 +379,28 @@ class JarvisCore:
             if self._rec is not None:
                 self._rec.stop()
                 return
-        self.speaker.stop()
+        self._interrupt()
         self._start_recording("auto")
 
-    def wake_detected(self, request_wav: bytes | None = None) -> None:
+    def wake_detected(self, request_wav: bytes | None = None, det: dict | None = None) -> None:
         if self._rec is not None or self.state == "thinking":
             return
-        self.speaker.stop()
-        if request_wav:  # «Пятница, открой телеграм» in one breath: the request is already recorded
+        self._interrupt()
+        det = det or {}
+        if request_wav or det.get("request_text"):
+            # «Пятница, открой телеграм» in one breath: the request is already recorded (and recognised)
             beep("listen")
-            self.set_state("thinking", "Распознаю…")
-            self._jobs.put(("audio", request_wav))
+            turn = VoiceTurn("voice")
+            turn.mark("speech_end", det.get("t_speech_end"))
+            turn.mark("rec_end")
+            text = det.get("request_text") or ""
+            if self.settings["stt_mode"] == "local" and stt_local.acceptable(text, det.get("request_conf", 0.0)):
+                turn.stt = "wake-local"
+                turn.mark("text")
+            else:
+                text = ""
+            self.set_state("thinking", "Думаю…" if text else "Распознаю…")
+            self._jobs.put(("voice", (turn, request_wav, text)))
             return
         self._start_recording("auto")
 
@@ -266,8 +409,19 @@ class JarvisCore:
             if self._rec is not None:
                 return
             kw = {"no_speech_timeout": float(no_speech_timeout)} if no_speech_timeout else {}
+            stt = None
+            if self.settings["stt_mode"] == "local":
+                path = stt_local.model_path()
+                if path and stt_local.is_loaded():
+                    try:
+                        stt = stt_local.StreamingSTT(stt_local.get_model(path))
+                    except Exception as e:
+                        log.warning("local stt unavailable: %s", e)
+                elif path:  # loads in ~0.7 s; this turn goes to the cloud, the next one is local
+                    threading.Thread(target=self._ensure_stt_model, daemon=True).start()
             rec = Recording(self.mic, auto_stop=(mode in ("auto", "reply")),
-                            on_level=lambda lv: self.emit("level", level=lv), **kw)
+                            on_level=lambda lv: self.emit("level", level=lv), stt=stt,
+                            silence_sec=self.settings["vad_silence_ms"] / 1000.0, **kw)
             self._rec = rec
             self._rec_mode = mode
         if self.wake:
@@ -291,14 +445,25 @@ class JarvisCore:
                 self.wake.suspended.clear()
         beep("stop")
         if wav and rec.speech_detected:
-            self._jobs.put(("audio", wav))
+            turn = VoiceTurn("voice")
+            turn.mark("speech_end", rec.t_speech_end)
+            turn.mark("rec_end", rec.t_end)
+            text = ""
+            if rec.stt is not None and stt_local.acceptable(rec.text, rec.conf):
+                text = rec.text
+                turn.stt = "local"
+                turn.mark("text")
+            elif rec.stt is not None:
+                log.info("local stt not confident (%r, conf %.2f) → cloud", rec.text[:80], rec.conf)
+            self.set_state("thinking", "Думаю…" if text else "Распознаю…")
+            self._jobs.put(("voice", (turn, wav, text)))
         else:
             self.set_state("idle", "Не расслышал" if not rec.cancelled and mode != "reply" else "")
 
     def submit_text(self, text: str) -> None:
         t = (text or "").strip()
         if t:
-            self.speaker.stop()
+            self._interrupt()
             self._jobs.put(("text", t))
 
     def say(self, text: str, *, interrupt: bool = False) -> None:
@@ -312,17 +477,32 @@ class JarvisCore:
                 return
             kind, payload = job
             try:
-                if kind == "audio":
+                if kind == "voice":
+                    turn, wav, text = payload
+                    if not text:
+                        self.set_state("thinking", "Распознаю…")
+                        turn.stt = "cloud"
+                        text = self.brain.transcribe(wav)
+                        turn.mark("text")
+                        if not text:
+                            self.set_state("idle", "Не расслышал")
+                            continue
+                    self.emit("chat", role="user", text=text)
+                    self._answer(text, voice=True, turn=turn)
+                elif kind == "audio":  # legacy path (kept for tests/tools)
                     self.set_state("thinking", "Распознаю…")
                     text = self.brain.transcribe(payload)
                     if not text:
                         self.set_state("idle", "Не расслышал")
                         continue
                     self.emit("chat", role="user", text=text)
-                    self._answer(text)
+                    self._answer(text, voice=True)
                 elif kind == "text":
                     self.emit("chat", role="user", text=payload)
                     self._answer(payload)
+            except TurnCancelled:
+                log.info("reply cancelled by the user")
+                self.emit("chat_partial", text="", done=True)
             except P.ProviderError as e:
                 msg = P.friendly_error(e)
                 log.warning("provider error: %s (%s)", e, getattr(e, "detail", "")[:200])
@@ -335,26 +515,101 @@ class JarvisCore:
                 self.emit("chat", role="system", text=P.friendly_error(e))
                 self.set_state("idle", "Ошибка")
 
-    def _answer(self, text: str) -> None:
+    def _answer(self, text: str, *, voice: bool = False, turn: VoiceTurn | None = None) -> None:
+        """Stream the reply: each finished sentence goes to TTS while the model keeps writing."""
         self.set_state("thinking", "Думаю…")
-        tools_used = []
+        turn = turn or VoiceTurn("text")
+        turn.mark("text")
+        self._turn = turn
+        self._answering = True
+        tools_used: list[str] = []
+        speak = bool(self.settings["speak_replies"])
+        stream = self.speaker.open_stream(turn) if speak else None
+        if stream is not None:
+            self.speaker.prewarm()
+        splitter = SentenceSplitter()
+        parts: list[str] = []
+        last_ui = [0.0]
+        spoken = [0]
+        acked: list[str] = []
+        lock = threading.Lock()
+        last_delta = [time.monotonic()]
+        finished = threading.Event()
+
+        def idle_flush() -> None:
+            # the model went quiet mid-sentence (usually: now writing a tool call) → say what we have
+            while not finished.wait(0.05):
+                with lock:
+                    if (splitter.buf.strip() and time.monotonic() - last_delta[0] > (0.3 if spoken[0] == 0 else 0.45)
+                            and len(splitter.buf.split()) >= (1 if spoken[0] == 0 else 3) and not turn.cancelled):
+                        for snt in splitter.flush():
+                            speak_sentence(snt)
+
+        def speak_sentence(snt: str) -> None:
+            if acked and spoken[0] == 1 and _same_ack(snt, acked[0]):
+                spoken[0] += 1
+                return
+            spoken[0] += 1
+            stream.feed(snt)
+
+        def on_text(delta: str) -> None:
+            if turn.cancelled:
+                raise TurnCancelled()
+            if "llm_first" not in turn.t:
+                turn.mark("llm_first")
+                turn.model = self.brain.current_model
+            parts.append(delta)
+            now = time.monotonic()
+            if now - last_ui[0] > 0.12:
+                last_ui[0] = now
+                self.emit("chat_partial", text="".join(parts))
+            if stream is not None:
+                with lock:
+                    last_delta[0] = now
+                    for snt in splitter.push(delta):
+                        speak_sentence(snt)
 
         def on_tool(n, a):
+            if turn.cancelled:
+                raise TurnCancelled()
             tools_used.append(n)
+            turn.model = turn.model or self.brain.current_model
             self.emit("tool", name=n, args=a)
+            if stream is not None:
+                with lock:
+                    for snt in splitter.flush():  # say «Открываю…» before the tool runs
+                        speak_sentence(snt)
+                    if voice and spoken[0] == 0 and n in TOOL_ACK:
+                        acked.append(TOOL_ACK[n])
+                        speak_sentence(TOOL_ACK[n])
 
-        reply = self.brain.ask(text, on_tool=on_tool)
+        if stream is not None:
+            threading.Thread(target=idle_flush, name="tts-idle-flush", daemon=True).start()
+        try:
+            reply = self.brain.ask(text, on_tool=on_tool, on_text=on_text,
+                                   fast=voice and bool(self.settings["fast_replies"]), voice=voice)
+            turn.model = turn.model or self.brain.last_model
+            finished.set()
+            if stream is not None and not turn.cancelled:
+                with lock:
+                    for snt in splitter.flush():
+                        speak_sentence(snt)
+                if not parts and not acked:  # nothing was streamed (tool-only answer → «Готово.»)
+                    stream.feed(reply)
+        finally:
+            finished.set()
+            if stream is not None:
+                stream.end()
+            self._answering = False
         if "set_live_mode" not in tools_used:
             want = live_intent(text)
             if want is not None and bool(self.settings.get("live_mode")) != want:
                 log.info("live intent fallback: model did not call set_live_mode -> %s", want)
                 self.set_live(want)
         self.emit("chat", role="jarvis", text=reply)
-        if self.settings["speak_replies"]:
-            self.set_state("speaking")
-            self.say(reply)
-        else:
-            self.set_state("idle")
+        if not speak or (not self.speaker.speaking and self.speaker.idle):
+            if self.state == "thinking":
+                self.set_state("idle")
 
     def _context(self) -> str:
         return context_line(self.session.snapshot(), self.last_fg.title)

@@ -8,10 +8,13 @@ let API = null;
 const NM = () => (S.settings && String(S.settings.assistant_name || '').trim()) || 'Джарвис';
 const isDefaultName = (n) => /^(джарвис|jarvis)$/i.test(String(n).trim());
 const VOICE_RU = { 'ru-RU-DmitryNeural': 'Дмитрий', 'ru-RU-SvetlanaNeural': 'Светлана' };
-const vname = (v) => VOICE_RU[v] || String(v).replace(/^[a-z]{2}-[A-Z]{2}-/, '').replace(/Neural$/, '');
+const vname = (v) => VOICE_RU[v] || pvLabel(v) || String(v).replace(/^[a-z]{2}-[A-Z]{2}-/, '').replace(/Neural$/, '');
+const EDGE2PIPER = { 'ru-RU-DmitryNeural': 'ru_RU-dmitri-medium', 'ru-RU-SvetlanaNeural': 'ru_RU-irina-medium' };
+function pvLabel(key) { const v = ((S.tts || {}).voices || []).find((x) => x.key === key); return v ? v.label : ''; }
+const mb = (b) => (b / 1048576).toFixed(0);
 const S = { settings: {}, providers: {}, voices: [], chat: [], focus: {}, stats: {}, state: 'idle', tab: 'home',
             chatMode: false, attach: false, wake: { enabled: false, mode: 'off' }, echo: [], hotkey: 'Ctrl+Alt+J',
-            live: { enabled: false, status: '' }, wakeDl: null };
+            live: { enabled: false, status: '' }, wakeDl: null, tts: { voices: [] }, ttsDl: null, liteModel: '' };
 const TALK = [['rare', 'Редко'], ['some', 'Иногда'], ['often', 'Часто']];
 const WAKE_MODES = [['name', 'По имени'], ['hey_jarvis', 'Hey Jarvis'], ['off', 'Выкл']];
 
@@ -61,7 +64,7 @@ async function start() {
   Object.assign(S, { settings: d.settings, providers: d.providers, voices: d.voices, abilities: d.abilities, tools: d.tools,
                      chat: d.chat || [], focus: d.focus, stats: d.stats, version: d.version, hotkey: d.hotkey,
                      autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir, presets: d.presets || [],
-                     live: d.live || { enabled: false, status: '' } });
+                     live: d.live || { enabled: false, status: '' }, tts: d.tts || { voices: [] }, liteModel: d.lite_model || '' });
   applyName();
   setState(d.state || 'idle');
   setMax(d.maximized);
@@ -96,13 +99,19 @@ function onEvent(e, d) {
   switch (e) {
     case 'state': setState(d.state, d.detail); break;
     case 'level': document.documentElement.style.setProperty('--lvl', Math.min(1, (d.level || 0) * 1.6).toFixed(3)); break;
-    case 'chat': addChat(d); break;
+    case 'chat': if (d.role === 'jarvis') dropPartial(); addChat(d); break;
+    case 'chat_partial': renderPartial(d); break;
+    case 'tts': { const was = S.tts && S.tts.downloading; S.tts = d; if (!d.downloading) S.ttsDl = null; renderTtsStatus();
+      if (was && !d.downloading) { if (d.error) toast(d.error, 'err', 7000); else { toast(`Голос «${pvLabel(was)}» скачан — теперь говорю офлайн`, '', 2600); if (S.tab === 'voice') buildVoice(); } }
+      break; }
+    case 'tts_dl': S.ttsDl = d; renderTtsStatus(); break;
+    case 'voice_timing': S.tts.timing = d; renderTtsStatus(); break;
     case 'tool': addMsg({ role: 'tool', text: d.label }); break;
     case 'focus': case 'tick': if (d.focus) { S.focus = d.focus; renderFocusLive(); } break;
     case 'notify': if (S.tab !== 'home' || !S.chatMode) toast(d.text); break;
     case 'error': toast(d.text, 'err', 6000); break;
     case 'wake': S.wake = d; if (!d.downloading) S.wakeDl = null; renderComposer(); renderWakeStatus(); if (d.error) toast('Слово-активатор недоступно: ' + d.error, 'err', 7000); break;
-    case 'wake_dl': S.wakeDl = d; renderComposer(); renderWakeStatus(); break;
+    case 'wake_dl': S.wakeDl = d; renderComposer(); renderWakeStatus(); renderTtsStatus(); break;
     case 'live': S.live = { enabled: !!d.enabled, status: d.status || '' }; S.settings.live_mode = !!d.enabled; renderComposer(); renderLiveStatus(); break;
     case 'visible': window.BG && BG.setPaused(!d.visible); break;
     case 'window': setMax(d.maximized); break;
@@ -173,10 +182,22 @@ function addChat(d) {
   addMsg({ role: d.role, text: d.text, kind: d.kind || '' });
   if ((d.role === 'user' || d.role === 'jarvis') && S.tab === 'home' && !S.chatMode) enterChat(true);
 }
+function renderPartial(d) {   // streamed reply: grows while the model writes (the final 'chat' replaces it)
+  if (!S.chatMode) return;
+  let el = $('#msgs .msg.partial');
+  if (d.done || !d.text) { if (el) el.remove(); return; }
+  if (!el) {
+    const t = $('#msgs .typing'); if (t) t.remove();
+    el = msgEl({ role: 'jarvis', text: '', ts: new Date().toTimeString().slice(0, 5) }); el.classList.add('partial'); $('#msgs').appendChild(el);
+  }
+  const b = el.querySelector('.bubble') || el; const txt = b.querySelector('.txt') || b;
+  txt.textContent = d.text; scrollChat(true);
+}
+function dropPartial() { const el = $('#msgs .msg.partial'); if (el) el.remove(); }
 function renderTyping() {
   const box = $('#msgs');
   const t = $('#msgs .typing');
-  if (S.state === 'thinking' && S.chatMode) {
+  if (S.state === 'thinking' && S.chatMode && !$('#msgs .msg.partial')) {
     if (!t) { const el = document.createElement('div'); el.className = 'msg jarvis typing'; el.innerHTML = `<div class="av">${icon('spark', 14)}</div><div class="bubble"><i></i><i></i><i></i></div>`; box.appendChild(el); scrollChat(); }
   } else if (t) t.remove();
 }
@@ -404,14 +425,26 @@ function buildModel() {
 }
 
 function buildVoice() {
-  const s = S.settings;
+  const s = S.settings; const t = S.tts || { voices: [] };
+  const local = s.tts_engine !== 'edge';
+  const pvs = t.voices || [];
   $('#p-voice').innerHTML = head('Голос', `Как ${esc(NM())} слушает и говорит.`) +
     `<div class="card sect"><h3>${icon('vol', 15)}Голос ассистента</h3>
-      <div class="grid2"><div class="field"><label>Голос (Microsoft Edge, бесплатно)</label><select id="v-voice" class="inp">${S.voices.map((v) => `<option ${v === s.voice ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
+      <div class="row"><div class="grow"><div class="t">Синтез речи</div><div class="s" id="v-tstat"></div></div>
+        <div class="seg" id="v-engine"><button data-e="piper" class="${local ? 'on' : ''}">Локальный (быстрый)</button><button data-e="edge" class="${local ? '' : 'on'}">Microsoft Edge (онлайн)</button></div></div>
+      <div class="grid2" style="margin-top:8px"><div class="field"><label>${local ? 'Голос (офлайн, Piper)' : 'Голос (Microsoft Edge, нужен интернет)'}</label>
+        ${local ? `<select id="v-pvoice" class="inp">${pvs.map((v) => `<option value="${esc(v.key)}" ${v.key === s.piper_voice ? 'selected' : ''}>${esc(v.label)} (${v.gender === 'ж' ? 'жен.' : 'муж.'})${v.installed ? '' : ' — скачать ~60 МБ'}</option>`).join('')}</select>`
+                : `<select id="v-voice" class="inp">${S.voices.map((v) => `<option ${v === s.voice ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`}</div>
       <div class="field"><label>&nbsp;</label><button id="v-test" class="btn">${icon('play', 14)}Проверить голос</button></div></div>
       <div class="row" style="margin-top:8px"><div class="grow"><div class="t">Скорость речи</div></div><input id="v-rate" class="slider" style="max-width:300px" type="range" min="-50" max="50" value="${s.tts_rate}"><span class="val" id="v-rate-v">${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</span></div>
       <div class="row"><div class="grow"><div class="t">Громкость</div></div><input id="v-vol" class="slider" style="max-width:300px" type="range" min="0" max="100" value="${s.tts_volume}"><span class="val" id="v-vol-v">${s.tts_volume}%</span></div>
       <div class="row"><div class="grow"><div class="t">Озвучивать ответы</div><div class="s">Если выключить — ответы только текстом</div></div>${tgl('v-speak', s.speak_replies)}</div></div>
+    <div class="card sect"><h3>${icon('zap', 15)}Скорость ответа<span class="badge">новое</span></h3>
+      <div class="row"><div class="grow"><div class="t">Быстрые ответы</div><div class="s">Голосом отвечает лёгкая модель${S.liteModel ? ' ' + esc(S.liteModel) : ''}: быстрее и больше бесплатный лимит. В чате остаётся основная.</div></div>${tgl('v-fast', s.fast_replies)}</div>
+      <div class="row"><div class="grow"><div class="t">Распознавание речи</div><div class="s" id="v-sttstat"></div></div>
+        <div class="seg" id="v-stt"><button data-m="local" class="${s.stt_mode !== 'cloud' ? 'on' : ''}">На компьютере</button><button data-m="cloud" class="${s.stt_mode === 'cloud' ? 'on' : ''}">Gemini</button></div></div>
+      <div class="row"><div class="grow"><div class="t">Пауза в конце фразы</div><div class="s">Столько тишины — и я считаю, что ты договорил. Меньше — быстрее ответ, но могу перебить на паузе</div></div><input id="v-sil" class="slider" style="max-width:240px" type="range" min="400" max="1500" step="50" value="${s.vad_silence_ms}"><span class="val" id="v-sil-v">${(s.vad_silence_ms / 1000).toFixed(2)} с</span></div>
+      <div class="note" id="v-timing"></div></div>
     <div class="card sect"><h3>${icon('keyboard', 15)}Горячая клавиша</h3>
       <div class="row"><div class="grow"><div class="t" id="v-hk">${esc(S.hotkey)}</div><div class="s">Удерживай — говоришь. Короткое нажатие — слушаю до паузы. Повторное — стоп.</div></div><button id="v-hk-btn" class="btn">Изменить</button></div></div>
     <div class="card sect"><h3>${icon('mic', 15)}Слово-активатор</h3>
@@ -420,21 +453,63 @@ function buildVoice() {
       ${s.wake_mode !== 'off' ? `<div class="row"><div class="grow"><div class="t">Чувствительность</div><div class="s">Меньше — реагирует охотнее (и чаще ошибается)</div></div><input id="v-thr" class="slider" style="max-width:240px" type="range" min="10" max="95" value="${Math.round(thrVal() * 100)}"><span class="val" id="v-thr-v">${thrVal().toFixed(2)}</span></div>` : ''}
       <div class="note">${s.wake_mode === 'hey_jarvis' ? 'Скажи по-английски <b>«Hey Jarvis»</b> — это фиксированная фраза, она не зависит от имени.' :
         `<b>По имени</b>: скажи «${esc(NM())}» или «Эй, ${esc(NM())}» — и сразу просьбу («${esc(NM())}, открой телеграм»), или подожди сигнал. Имя меняется во вкладке «ИИ» — я сразу начну откликаться на новое.`}
-        Всё распознаётся офлайн, звук никуда не отправляется. Для режима «по имени» один раз скачивается модель Vosk (~45 МБ).</div></div>`;
-  $('#v-voice').onchange = () => save({ voice: $('#v-voice').value });
-  $('#v-test').onclick = () => API.test_voice($('#v-voice').value, +$('#v-rate').value, +$('#v-vol').value);
+        Слово-активатор распознаётся офлайн, звук никуда не отправляется. Для режима «по имени» и локального распознавания один раз скачивается модель Vosk (~45 МБ).</div></div>`;
+  $$('#v-engine [data-e]').forEach((b) => b.onclick = async () => { if (await save({ tts_engine: b.dataset.e }, true)) { buildVoice(); toast(b.dataset.e === 'piper' ? 'Голос: локальный (быстрый)' : 'Голос: Microsoft Edge (онлайн)', '', 1600); } });
+  if ($('#v-pvoice')) $('#v-pvoice').onchange = async () => { const k = $('#v-pvoice').value; if (await save({ piper_voice: k }, true)) {
+    const v = pvs.find((x) => x.key === k); toast(v && !v.installed ? `Скачиваю голос «${v.label}» (~60 МБ, один раз)…` : `Голос: ${pvLabel(k)}`, '', 2400); buildVoice(); } };
+  if ($('#v-voice')) $('#v-voice').onchange = () => save({ voice: $('#v-voice').value });
+  $('#v-test').onclick = async () => {
+    const r = await API.test_voice(local ? s.voice : $('#v-voice').value, +$('#v-rate').value, +$('#v-vol').value, local ? 'piper' : 'edge', local ? $('#v-pvoice').value : '');
+    if (r && r.downloading) { if (r.tts) { S.tts = r.tts; renderTtsStatus(); } toast(`Сначала скачаю голос «${pvLabel(r.downloading)}» (~60 МБ, один раз) — потом нажми ещё раз`, '', 3200); }
+  };
   $('#v-rate').oninput = () => { const v = +$('#v-rate').value; $('#v-rate-v').textContent = (v > 0 ? '+' : '') + v + '%'; };
   $('#v-rate').onchange = () => save({ tts_rate: +$('#v-rate').value }, true);
   $('#v-vol').oninput = () => { $('#v-vol-v').textContent = $('#v-vol').value + '%'; };
   $('#v-vol').onchange = () => save({ tts_volume: +$('#v-vol').value }, true);
+  $('#v-fast').onclick = async () => { await save({ fast_replies: !S.settings.fast_replies }, true); buildVoice(); };
+  $$('#v-stt [data-m]').forEach((b) => b.onclick = async () => { if (await save({ stt_mode: b.dataset.m }, true)) buildVoice(); });
+  $('#v-sil').oninput = () => { $('#v-sil-v').textContent = (+$('#v-sil').value / 1000).toFixed(2) + ' с'; };
+  $('#v-sil').onchange = () => save({ vad_silence_ms: +$('#v-sil').value }, true);
   if ($('#v-thr')) {
     $('#v-thr').oninput = () => { $('#v-thr-v').textContent = (+$('#v-thr').value / 100).toFixed(2); };
     $('#v-thr').onchange = () => save({ [S.settings.wake_mode === 'name' ? 'name_threshold' : 'wake_threshold']: +$('#v-thr').value / 100 }, true);
   }
   $$('#v-wmode [data-w]').forEach((b) => b.onclick = () => setWakeMode(b.dataset.w));
   renderWakeStatus();
+  renderTtsStatus();
   $('#v-speak').onclick = async () => { await save({ speak_replies: !S.settings.speak_replies }, true); buildVoice(); };
   $('#v-hk-btn').onclick = captureHotkey;
+}
+function renderTtsStatus() {
+  const s = S.settings; const t = S.tts || {};
+  const el = $('#v-tstat');
+  if (el) {
+    const v = (t.voices || []).find((x) => x.key === s.piper_voice) || {};
+    const dl = S.ttsDl && t.downloading ? S.ttsDl : null;
+    let txt;
+    if (t.downloading) txt = `Скачиваю голос «${pvLabel(t.downloading)}»… ` + (dl && dl.total ? `${Math.round(dl.done / dl.total * 100)}% · ${mb(dl.done)} из ${mb(dl.total)} МБ` : '');
+    else if (s.tts_engine === 'edge') txt = 'Через интернет: каждая фраза 1–10 с, сервис иногда не отвечает';
+    else if (t.error) txt = t.error + ' — пока говорю голосом Microsoft Edge';
+    else if (!v.installed) txt = 'Голос ещё не скачан — пока говорю голосом Microsoft Edge';
+    else txt = `Офлайн, на этом компьютере: фраза за ~0,1 с${t.active === 'piper' ? '' : ' (загружаю…)'}`;
+    el.textContent = txt;
+  }
+  const st = $('#v-sttstat');
+  if (st) {
+    const x = t.stt || {}; const d = S.wakeDl || {};
+    st.textContent = s.stt_mode === 'cloud' ? 'Звук уходит в Gemini: точнее на шуме, но +1–2 с и ещё один запрос к лимиту'
+      : x.model ? 'Vosk, офлайн: текст готов сразу, как договорил. Если не уверен в словах — спрошу Gemini'
+      : (S.wake.downloading || S.wakeDl) ? `Скачиваю модель распознавания… ${d.total ? Math.round(d.done / d.total * 100) : 0}%`
+      : 'Модель распознавания не скачана — скачаю (~45 МБ), пока распознаёт Gemini';
+  }
+  const tm = $('#v-timing');
+  if (tm) {
+    const x = t.timing;
+    const f = (v) => v == null ? '—' : v.toFixed(2).replace('.', ',');
+    tm.innerHTML = x && x.first_audio != null ? `Последний голосовой ответ: <b>${f(x.first_audio)} с</b> от конца фразы до первого звука
+      (пауза ${f(x.endpoint)} · распознавание ${f(x.stt)}${x.stt_mode ? ' ' + (x.stt_mode === 'cloud' ? 'Gemini' : 'локально') : ''} · модель ${f(x.llm_first)} · синтез ${f(x.tts)} · старт ${f(x.play)}).`
+      : 'Ответ озвучивается по предложениям, пока модель ещё пишет: первая фраза звучит сразу.';
+  }
 }
 function thrVal() { const s = S.settings; return s.wake_mode === 'name' ? (s.name_threshold ?? 0.5) : s.wake_threshold; }
 function captureHotkey() {
@@ -509,7 +584,10 @@ function buildAI() {
   const pk = s.character_preset || 'butler';
   const pr = presetOf(pk);
   const charText = String(s.character || '').trim() || (pr ? pr.prompt : '');
-  const sugg = pr && (pr.voice !== s.voice || pr.rate !== s.tts_rate) ? pr : null;
+  const local = s.tts_engine !== 'edge';
+  const prVoice = pr ? (local ? (EDGE2PIPER[pr.voice] || s.piper_voice) : pr.voice) : '';
+  const curVoice = local ? s.piper_voice : s.voice;
+  const sugg = pr && (prVoice !== curVoice || pr.rate !== s.tts_rate) ? { ...pr, voice: prVoice } : null;
   $('#p-ai').innerHTML = head('ИИ', 'Имя и характер ассистента, и то, как он следит за фокусом.') +
     `<div class="card sect"><h3>${icon('spark', 15)}Имя</h3>
       <div class="grid2"><div class="field"><label>Как зовут ассистента</label><input id="a-aname" class="inp" maxlength="30" placeholder="Джарвис" value="${esc(s.assistant_name || 'Джарвис')}"></div>
@@ -519,7 +597,7 @@ function buildAI() {
       <div class="pchips">${(S.presets || []).map((p) => `<button class="pchip${p.key === pk ? ' on' : ''}" data-preset="${p.key}">${esc(p.label)}</button>`).join('')}<button class="pchip${pk === 'custom' ? ' on' : ''}" data-preset="custom">${icon('edit', 12)}Свой</button></div>
       <div class="field" style="margin-top:12px"><label>Характер — как ассистент говорит и ведёт себя (можно переписать своими словами)</label>
         <textarea id="a-char" class="inp" rows="3" maxlength="2000" placeholder="Например: весёлый пират, говорит «йо-хо-хо», но помогает с домашкой">${esc(charText)}</textarea></div>
-      ${sugg ? `<div class="row vsug"><div class="grow"><div class="t">Голос под характер: ${esc(vname(sugg.voice))}, скорость ${sugg.rate > 0 ? '+' : ''}${sugg.rate}%</div><div class="s">Сейчас: ${esc(vname(s.voice))}, ${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</div></div>
+      ${sugg ? `<div class="row vsug"><div class="grow"><div class="t">Голос под характер: ${esc(vname(sugg.voice))}, скорость ${sugg.rate > 0 ? '+' : ''}${sugg.rate}%</div><div class="s">Сейчас: ${esc(vname(curVoice))}, ${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</div></div>
         <button id="a-vtry" class="btn ghost sm">${icon('play', 13)}Послушать</button><button id="a-vapply" class="btn sm">${icon('check', 13)}Применить</button></div>` : ''}
       <div class="field" style="margin-top:12px"><label>Дополнительные пожелания (что важно знать о тебе, о чём помнить)</label>
         <textarea id="a-persona" class="inp" placeholder="Например: я учусь в 10 классе, готовлюсь к ЕГЭ. Шути иногда.">${esc(s.persona)}</textarea></div>
@@ -547,8 +625,8 @@ function buildAI() {
   $('#a-aname').onchange = () => saveName();
   $('#a-aname').onkeydown = (e) => { if (e.key === 'Enter') e.target.blur(); };
   if (sugg) {
-    $('#a-vtry').onclick = () => API.test_voice(sugg.voice, sugg.rate, s.tts_volume);
-    $('#a-vapply').onclick = async () => { if (await save({ voice: sugg.voice, tts_rate: sugg.rate }, true)) { toast(`Голос: ${vname(sugg.voice)}`, '', 1800); buildAI(); buildVoice(); } };
+    $('#a-vtry').onclick = () => local ? API.test_voice('', sugg.rate, s.tts_volume, 'piper', sugg.voice) : API.test_voice(sugg.voice, sugg.rate, s.tts_volume, 'edge', '');
+    $('#a-vapply').onclick = async () => { if (await save(local ? { piper_voice: sugg.voice, tts_rate: sugg.rate } : { voice: sugg.voice, tts_rate: sugg.rate }, true)) { toast(`Голос: ${vname(sugg.voice)}`, '', 1800); buildAI(); buildVoice(); } };
   }
   $('#a-confirm').onclick = async () => { await save({ confirm_actions: !S.settings.confirm_actions }, true); buildAI(); };
   $('#a-save').onclick = async () => {

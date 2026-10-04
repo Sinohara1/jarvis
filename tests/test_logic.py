@@ -351,6 +351,190 @@ def test_live_intent_fallback():
     for t in neutral: assert live_intent(t) is None, t
 
 
+# ─── v1.3: fast voice ────────────────────────────────────────────────────────
+
+def test_sentence_splitter():
+    from jarvis_app.audio import SentenceSplitter, split_sentences
+    sp = SentenceSplitter()
+    out = []
+    for d in ["Привет", "! Сейчас ", "открою ютуб. Это", " займёт секунду, т. е. совсем", " чуть-чуть."]:
+        out += sp.push(d)
+    out += sp.flush()
+    assert out[0] == "Привет!", out
+    assert "".join(out).replace(" ", "") == "Привет!Сейчасоткроюютуб.Этозаймётсекунду,т.е.совсемчуть-чуть.".replace(" ", ""), out
+    assert not any(x.endswith("т.") for x in out), out  # no cut after an abbreviation
+    # a long first sentence is cut at a clause so the first sound comes early
+    sp = SentenceSplitter()
+    first = sp.push("Солнечный свет рассеивается в атмосфере, и синяя часть спектра рассеивается сильнее")
+    assert first and first[0].endswith(","), first
+    # a newline (end of text before a tool call) cuts too
+    sp = SentenceSplitter()
+    assert sp.push("Открываю ютуб") == [] and sp.push("\n") == ["Открываю ютуб"]
+    # hard cut at max_len
+    sp = SentenceSplitter(max_len=50)
+    got = sp.push("слово " * 30)
+    assert got and all(len(x) <= 50 for x in got), got
+    assert split_sentences("Раз. Два три четыре пять шесть. Семь!") and split_sentences("") == []
+
+
+def test_needs_tools_router():
+    from jarvis_app.brain import needs_tools
+    yes = ["Айри, открой телеграм", "поставь таймер на пять минут", "Найди на компьютере файл с рефератом",
+           "я делаю домашку по физике", "включи живой режим", "сколько сейчас часов?", "да", "давай"]
+    no = ["Почему небо голубое?", "Какая столица Австралии?", "Расскажи короткий анекдот про программистов",
+          "как дела у тебя сегодня", "сколько будет семь умножить на восемь"]
+    for t in yes: assert needs_tools(t), t
+    for t in no: assert not needs_tools(t), t
+
+
+def test_v13_settings():
+    s = normalize_settings({})
+    assert s["tts_engine"] == "piper" and s["stt_mode"] == "local" and s["fast_replies"] is True
+    assert s["piper_voice"] == "ru_RU-dmitri-medium" and s["vad_silence_ms"] == 600
+    s = normalize_settings({"tts_engine": "x", "stt_mode": "y", "piper_voice": "../evil", "vad_silence_ms": 5})
+    assert s["tts_engine"] == "piper" and s["stt_mode"] == "local" and s["piper_voice"] == "ru_RU-dmitri-medium"
+    assert s["vad_silence_ms"] == 400
+    s = normalize_settings({"tts_engine": "edge", "stt_mode": "cloud", "piper_voice": "ru_RU-irina-medium",
+                            "fast_replies": False, "vad_silence_ms": 900})
+    assert (s["tts_engine"], s["stt_mode"], s["piper_voice"], s["fast_replies"], s["vad_silence_ms"]) == \
+        ("edge", "cloud", "ru_RU-irina-medium", False, 900)
+
+
+def test_piper_catalog_and_rate():
+    from jarvis_app import tts_local as T
+    assert T.DEFAULT_VOICE in T.PIPER_VOICES and len(T.PIPER_VOICES) >= 4
+    for k, v in T.PIPER_VOICES.items():
+        assert k.startswith("ru_RU-") and len(v["md5"]) == 32 and len(v["md5_json"]) == 32, k
+        on, js = T.voice_files(k, root="/nonexistent")
+        assert on.endswith(k + ".onnx") and js.endswith(".onnx.json")
+        assert not T.installed(k, root="/nonexistent")
+    for edge, piper in T.EDGE_TO_PIPER.items():
+        assert piper in T.PIPER_VOICES, (edge, piper)
+
+
+def test_stt_acceptable():
+    from jarvis_app.stt_local import acceptable, words_conf, words_text
+    assert acceptable("открой телеграм", 0.9) and not acceptable("открой телеграм", 0.3)
+    assert not acceptable("", 1.0) and not acceptable("а", 1.0)
+    w = [{"word": "открой", "conf": 1.0}, {"word": "ютуб", "conf": 0.5}]
+    assert abs(words_conf(w) - 0.75) < 1e-6 and words_text(w) == "Открой ютуб"
+
+
+class _FakeResp:
+    def __init__(self, chunks): self.chunks = chunks
+    def iter_content(self, chunk_size=None): return iter(self.chunks)
+
+
+def test_sse_stream_accumulator():
+    import json as _j
+    from jarvis_app.providers import iter_sse, StreamAccumulator
+    ev1 = {"candidates": [{"content": {"parts": [{"text": "Открываю\u2028 ютуб"}]}}]}
+    ev2 = {"candidates": [{"content": {"parts": [{"text": ".", "thoughtSignature": "sig"}]}}]}
+    ev3 = {"candidates": [{"content": {"parts": [{"functionCall": {"name": "open_url", "args": {"url": "https://youtube.com"}}}]}}],
+           "modelVersion": "gemini-x"}
+    body = b"".join(b"data: " + _j.dumps(e, ensure_ascii=False).encode("utf-8") + b"\r\n\r\n" for e in (ev1, ev2, ev3))
+    chunks = [body[i:i + 7] for i in range(0, len(body), 7)]  # split mid-UTF-8 and mid-line
+    events = list(iter_sse(_FakeResp(chunks)))
+    assert len(events) == 3, events
+    acc = StreamAccumulator("m")
+    deltas = []
+    for e in events:
+        deltas += acc.add(e)
+    assert deltas == ["Открываю\u2028 ютуб", ".", "\n"], deltas
+    r = acc.result()
+    assert r.text == "Открываю\u2028 ютуб." and r.model == "gemini-x"
+    assert [c.name for c in r.tool_calls] == ["open_url"] and r.tool_calls[0].args["url"].endswith("youtube.com")
+    parts = r.raw_message["parts"]
+    assert parts[0]["text"] == "Открываю\u2028 ютуб." and parts[0]["thoughtSignature"] == "sig"
+    assert "functionCall" in parts[1]
+    try:
+        StreamAccumulator("m").result()
+        raise AssertionError("empty stream must raise")
+    except Exception as e:
+        assert "Пустой" in str(e)
+
+
+def test_tool_ack_dedup():
+    from jarvis_app.core import _same_ack, TOOL_ACK
+    assert _same_ack("Открываю ютуб.", TOOL_ACK["open_url"])
+    assert not _same_ack("Сделано, музыка для концентрации уже играет на ютубе.", TOOL_ACK["open_url"])
+    assert not _same_ack("Готово.", TOOL_ACK["open_url"])
+
+
+def test_brain_plan_and_cooldown():
+    import time as _t
+    from jarvis_app.brain import Brain
+    from jarvis_app.providers import RateLimitError
+    b = Brain.__new__(Brain)
+    b.cooldown_until = b.lite_cooldown_until = 0.0
+    assert b._plan("flash", "lite", fast=True) == ["lite", "flash"]
+    assert b._plan("flash", "lite", fast=False) == ["flash", "lite"]
+    b._cool("flash", "flash", RateLimitError("q", retry_after=None, daily=True))
+    assert b.cooldown_until - _t.monotonic() > 3000  # a daily quota is skipped for hours, not minutes
+    assert b._plan("flash", "lite", fast=False) == ["lite", "flash"]
+    b._cool("lite", "flash", RateLimitError("q", retry_after=20, daily=False))
+    assert 10 < b.lite_cooldown_until - _t.monotonic() <= 20
+    assert b._plan("flash", "flash", fast=True) == ["flash"]
+
+
+def test_speaker_pipeline_and_interrupt():
+    import time as _t
+    import numpy as np
+    from jarvis_app.audio import Speaker, VoiceTurn
+
+    class FakePiper:
+        def __init__(self): self.said = []
+        def ready(self, key): return True
+        def synth(self, text, key, rate):
+            self.said.append(text)
+            return np.zeros(2205, dtype=np.int16), 22050  # 0.1 s
+    fp = FakePiper()
+    turns = []
+    sp = Speaker(lambda: {"tts_engine": "piper", "piper_voice": "ru_RU-dmitri-medium", "tts_rate": 0, "tts_volume": 0},
+                 on_turn=turns.append, piper=fp)
+    sp.null_output = True
+    t = VoiceTurn("voice")
+    t.mark("speech_end")
+    st = sp.open_stream(t)
+    st.feed("Раз.")
+    st.feed("Два.")
+    assert not sp.idle
+    st.end()
+    for _ in range(100):
+        if sp.idle: break
+        _t.sleep(0.02)
+    assert sp.idle and fp.said == ["Раз.", "Два."] and turns == [t]
+    # interrupt: a stale stream says nothing more
+    st = sp.open_stream(None)
+    for i in range(20):
+        st.feed(f"Фраза номер {i}.")
+    _t.sleep(0.05)
+    sp.stop()
+    st.feed("После стопа.")
+    st.end()
+    for _ in range(100):
+        if sp.idle: break
+        _t.sleep(0.02)
+    assert sp.idle and "После стопа." not in fp.said and len(fp.said) < 22, fp.said
+    sp.shutdown()
+
+
+def test_vad_endpoint():
+    import numpy as np
+    from jarvis_app.vad import EndpointDetector
+    rng = np.random.default_rng(0)
+    quiet = (rng.standard_normal(1280) * 20).astype(np.int16)
+    loud = (rng.standard_normal(1280) * 3000).astype(np.int16)
+    lvl = lambda c: float(np.sqrt(np.mean(c.astype(np.float32) ** 2)))
+    en = EndpointDetector(use_silero=False)
+    assert en.kind == "energy"
+    got = [en.voiced(quiet, lvl(quiet), k * 0.08) for k in range(6)] + [en.voiced(loud, lvl(loud), 0.5 + k * 0.08) for k in range(3)]
+    assert not any(got[:6]) and all(got[6:]), got
+    si = EndpointDetector(use_silero=True)
+    if si.kind == "silero":  # model ships in models/; white noise / hum is not speech
+        assert not any(si.voiced(c, lvl(c), k * 0.08) for k, c in enumerate([quiet] * 5 + [loud] * 5))
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:

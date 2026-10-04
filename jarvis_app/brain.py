@@ -59,6 +59,43 @@ SCREEN_SCHEMA = {
 }
 
 
+VOICE_HINT = ("\nЭто голосовая реплика: запрос распознан локально и может содержать мелкие ошибки распознавания "
+              "(окончания, слитные слова) — понимай по смыслу и не переспрашивай из-за них. Ответ сразу озвучивается: "
+              "одно короткое предложение, максимум два (до 25 слов), сразу по сути, без вступлений, меток вроде «Короткий ответ:» и повторения вопроса.\n"
+              "Если нужен инструмент: в том же ответе сначала скажи одну очень короткую фразу о том, что делаешь "
+              "(«Открываю ютуб.», «Ставлю напоминание.»), и сразу вызови инструмент. После успешного выполнения ничего "
+              "не повторяй (ответь пустой строкой); говори, только если результат важен: нашёл файлы, ошибка, вопрос.\n")
+NO_TOOLS_HINT = ("\nСейчас инструменты недоступны. Если для ответа нужно действие на компьютере (открыть программу, сайт "
+                 "или файл, поиск в интернете, найти файл, напоминание или таймер, фокус-сессия, посмотреть на экран, "
+                 "живой режим) — ответь ровно: [[TOOLS]]\n")
+ESCAPE = "[[TOOLS]]"
+
+# Voice questions that clearly need no PC action are answered without tool declarations: measured
+# first token 0.48 s vs 0.70 s with tools (gemini-3.5-flash-lite). Anything that smells like an action
+# goes straight to the tool path; if the model still wants a tool it answers [[TOOLS]] and we retry.
+_ACTION_RE = re.compile(
+    r"(откр|запус|включ|выключ|отключ|найд|найт|поищ|ищи|загугл|погугл|поставь|постав|напом|таймер|засек|будильн|"
+    r"фокус|помодоро|сесси|пауз|останов|продолж|отмен|экран|посмотри|глянь|что у меня|живой|следи|подсказ|"
+    r"тихо|хватит|помолчи|не меша|сайт|ютуб|youtube|браузер|файл|папк|документ|скача|музык|видео|телеграм|"
+    r"дискорд|стим|steam|chrome|хром|спотиф|календар|делаю|занимаюсь|работаю|учу|домашк|готовлюсь|минут|\bчас|полчаса)",
+    re.IGNORECASE)
+
+
+def needs_tools(text: str) -> bool:
+    t = (text or "").lower()
+    if len(t.split()) <= 2:  # «да», «давай», «нет» — may confirm a pending action
+        return True
+    return bool(_ACTION_RE.search(t))
+
+
+class _NeedTools(Exception):
+    pass
+
+
+class TurnCancelled(Exception):
+    """The user interrupted (new question / stop) while the reply was streaming."""
+
+
 class Brain:
     def __init__(self, get_settings, actions, get_context=None) -> None:
         self.get_settings = get_settings
@@ -69,6 +106,9 @@ class Brain:
         self._hist_provider: str | None = None
         self._providers: dict[tuple, P.Provider] = {}
         self.cooldown_until = 0.0  # chat model rate-limit cooldown (monotonic)
+        self.lite_cooldown_until = 0.0
+        self.last_model = ""
+        self.current_model = ""
 
     # ── provider plumbing ──
     def provider(self, name: str | None = None) -> P.Provider:
@@ -95,7 +135,7 @@ class Brain:
         with self.lock:
             self.history = []
 
-    def _system(self) -> str:
+    def _system(self, voice: bool = False) -> str:
         ti = time_info()
         ctx = self.get_context() or ""
         st = self.get_settings()
@@ -108,7 +148,7 @@ class Brain:
                       "«Открыть …?» и вызывай инструмент только после явного «да».\n")
         return (build_system_prompt(st) + extra
                 + f"\nСейчас: {ti['weekday']}, {ti['date']}, {ti['time']}.\n"
-                + (ctx + "\n" if ctx else ""))
+                + (ctx + "\n" if ctx else "") + (VOICE_HINT if voice else ""))
 
     # ── speech to text ──
     def transcribe(self, wav: bytes) -> str:
@@ -141,7 +181,9 @@ class Brain:
         raise last or P.ProviderError("Не удалось распознать речь")
 
     # ── chat with tools ──
-    def ask(self, text: str, on_tool=None) -> str:
+    def ask(self, text: str, on_tool=None, on_text=None, *, fast: bool = False, voice: bool = False) -> str:
+        """One user turn. on_text(delta) streams the visible reply as it arrives (all tool rounds).
+        fast=True → lite model first (voice turns with «Быстрые ответы»), chat model as fallback."""
         with self.lock:
             s = self.get_settings()
             pname = s["provider"]
@@ -152,51 +194,99 @@ class Brain:
             chat_m, lite_m = self.models(pname)
             self.history.append(prov.user_message(text))
             start_len = len(self.history) - 1
+            route = (voice and on_text is not None and not s.get("confirm_actions") and not needs_tools(text))
             try:
-                reply = self._loop(prov, chat_m, lite_m, on_tool)
+                reply = self._loop(prov, chat_m, lite_m, on_tool, on_text, fast=fast, voice=voice, route=route)
             except Exception:
                 del self.history[start_len:]  # keep history consistent
                 raise
             self._trim()
             return reply
 
-    def _call(self, prov: P.Provider, chat_m: str, lite_m: str) -> P.LLMResult:
-        """Chat call with fallback to the lite model on overload / rate limit."""
-        system = self._system()
-        models = [chat_m] if time.monotonic() >= self.cooldown_until else []
-        if lite_m and lite_m != chat_m:
-            models.append(lite_m)
-        if not models:
-            models = [chat_m]
+    def _plan(self, chat_m: str, lite_m: str, fast: bool) -> list[str]:
+        now = time.monotonic()
+        chat_ok = now >= self.cooldown_until
+        lite_ok = now >= self.lite_cooldown_until
+        if fast:
+            order = [lite_m, chat_m] if lite_ok or not chat_ok else [chat_m, lite_m]
+        else:
+            order = [chat_m, lite_m] if chat_ok else [lite_m, chat_m]
+        return [m for m in dict.fromkeys(order) if m]
+
+    def _cool(self, model: str, chat_m: str, e: P.RateLimitError) -> None:
+        # a per-day quota will not come back in a minute: stop knocking for hours, not 5 min
+        sec = min(6 * 3600.0, e.retry_after or 3600.0) if e.daily else min(300.0, e.retry_after or 60.0)
+        until = time.monotonic() + sec
+        if model == chat_m:
+            self.cooldown_until = until
+        else:
+            self.lite_cooldown_until = until
+        log.info("rate limit on %s: %s, skip it for %.0f s", model, "daily quota" if e.daily else "per-minute", sec)
+
+    def _call(self, prov: P.Provider, chat_m: str, lite_m: str, on_text=None, *, fast: bool = False,
+              voice: bool = False, tools: list | None = TOOLS, extra: str = "") -> P.LLMResult:
+        """Chat call with fallback between chat/lite models on overload / rate limit."""
+        system = self._system(voice) + extra
+        models = self._plan(chat_m, lite_m, fast)
         last: Exception | None = None
+        streamed = [False]
+
+        def emit(delta: str) -> None:
+            streamed[0] = True
+            if on_text:
+                on_text(delta)
+
+        max_tokens = 600 if voice else 2048
         for i, model in enumerate(models):
+            first_timeout = 12 if (i == 0 and len(models) > 1) else 30
             try:
                 t0 = time.monotonic()
-                res = prov.chat(model, system, self.history, TOOLS,
-                                timeout=12 if (i == 0 and len(models) > 1) else 30)
-                log.info("chat %s %.1fs tools=%s", res.model or model, time.monotonic() - t0,
-                         [c.name for c in res.tool_calls])
+                self.current_model = model
+                if on_text is not None:
+                    res = prov.chat_stream(model, system, self.history, tools, on_text=emit,
+                                           timeout=first_timeout, max_tokens=max_tokens)
+                else:
+                    res = prov.chat(model, system, self.history, tools, timeout=first_timeout)
+                self.last_model = res.model or model
+                log.info("chat %s %.1fs tools=%s%s", res.model or model, time.monotonic() - t0,
+                         [c.name for c in res.tool_calls], " (stream)" if on_text else "")
                 return res
             except P.RateLimitError as e:
                 last = e
-                if model == chat_m:
-                    self.cooldown_until = time.monotonic() + min(300.0, e.retry_after or 60.0)
-                if e.retry_after and e.retry_after <= 6 and i == len(models) - 1:
+                if streamed[0]:
+                    raise
+                self._cool(model, chat_m, e)
+                if e.retry_after and e.retry_after <= 6 and i == len(models) - 1 and not e.daily:
                     time.sleep(e.retry_after + 0.3)
-                    return prov.chat(model, system, self.history, TOOLS, timeout=30)
+                    if on_text is not None:
+                        return prov.chat_stream(model, system, self.history, tools, on_text=emit,
+                                                timeout=30, max_tokens=max_tokens)
+                    return prov.chat(model, system, self.history, tools, timeout=30)
                 continue
             except (P.OverloadedError, P.ModelNotFoundError) as e:
                 last = e
+                if streamed[0]:
+                    raise
                 continue
         raise last or P.ProviderError("Нет ответа")
 
-    def _loop(self, prov: P.Provider, chat_m: str, lite_m: str, on_tool) -> str:
+    def _loop(self, prov: P.Provider, chat_m: str, lite_m: str, on_tool, on_text=None, *,
+              fast: bool = False, voice: bool = False, route: bool = False) -> str:
+        said: list[str] = []
+        if route:
+            res = self._try_without_tools(prov, chat_m, lite_m, on_text, fast=fast)
+            if res is not None:
+                if res.raw_message is not None:
+                    self.history.append(res.raw_message)
+                return res.text.replace(ESCAPE, "").strip() or "Готово."
         for _round in range(MAX_TOOL_ROUNDS):
-            res = self._call(prov, chat_m, lite_m)
+            res = self._call(prov, chat_m, lite_m, on_text, fast=fast, voice=voice)
             if res.raw_message is not None:
                 self.history.append(res.raw_message)
+            if res.text:
+                said.append(res.text)
             if not res.tool_calls:
-                return res.text or "Готово."
+                return " ".join(said).strip() or "Готово."
             results = []
             for c in res.tool_calls:
                 if on_tool:
@@ -206,7 +296,45 @@ class Brain:
                         pass
                 results.append(self.actions.execute(c.name, c.args))
             self.history.extend(prov.tool_result_messages(res.tool_calls, results))
-        return "Сделал, что смог."
+        return " ".join(said).strip() or "Сделал, что смог."
+
+    def _try_without_tools(self, prov, chat_m, lite_m, on_text, *, fast: bool) -> P.LLMResult | None:
+        """Fast path for plain questions. Returns None if the model asked for tools ([[TOOLS]])."""
+        buf: list[str] = []
+        passing = [False]
+
+        def gate(delta: str) -> None:
+            if passing[0]:
+                d = delta.replace(ESCAPE, "")
+                if d:
+                    on_text(d)
+                return
+            buf.append(delta)
+            acc = "".join(buf).lstrip()
+            if acc.startswith(ESCAPE):
+                raise _NeedTools()
+            if ESCAPE.startswith(acc):
+                return  # could still become the escape token: hold it
+            passing[0] = True
+            on_text(acc.replace(ESCAPE, ""))
+
+        t0 = time.monotonic()
+        try:
+            res = self._call(prov, chat_m, lite_m, gate, fast=fast, voice=True, tools=None, extra=NO_TOOLS_HINT)
+        except _NeedTools:
+            log.info("fast path: model wants tools (%.2fs) → retry with tools", time.monotonic() - t0)
+            return None
+        except P.ProviderError as e:
+            if passing[0]:
+                raise
+            log.info("fast path failed (%s) → normal path", e)
+            return None
+        if res.text.strip().startswith(ESCAPE) or res.tool_calls:
+            return None
+        if not passing[0] and buf:
+            on_text("".join(buf))
+        log.info("fast path (no tools): answered in %.2fs", time.monotonic() - t0)
+        return res
 
     def _trim(self) -> None:
         if len(self.history) <= MAX_HISTORY:

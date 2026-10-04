@@ -21,3 +21,4 @@ webview/
 *.png
 !web/**/*.png
 *.zip
+build_assets/

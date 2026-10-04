@@ -1,5 +1,5 @@
-"""Microphone capture (sounddevice), simple VAD recording, edge-tts speech
-output played via Windows MCI (no console windows), and UI beeps."""
+"""Microphone capture (sounddevice), VAD recording with live local STT, sentence-streamed speech
+(local Piper → sounddevice, or edge-tts → Windows MCI), and UI beeps."""
 
 from __future__ import annotations
 
@@ -124,20 +124,31 @@ class MicHub:
 
 
 class Recording:
-    """Collect mic audio until stop() (hold mode) or VAD end-of-speech (auto)."""
+    """Collect mic audio until stop() (hold mode) or end-of-speech (auto).
+
+    End of speech = `silence_sec` without voice after speech started (Silero VAD, energy fallback).
+    Optional `stt` (StreamingSTT) is fed live so the transcript is ready right at the end."""
 
     def __init__(self, hub: MicHub, *, auto_stop: bool, max_sec: float = 30.0,
-                 no_speech_timeout: float = 6.0, silence_sec: float = 1.2,
-                 on_level=None) -> None:
+                 no_speech_timeout: float = 6.0, silence_sec: float = 0.6,
+                 on_level=None, stt=None, use_silero: bool = True) -> None:
         self.hub = hub
         self.auto_stop = auto_stop
         self.max_sec = max_sec
         self.no_speech_timeout = no_speech_timeout
         self.silence_sec = silence_sec
         self.on_level = on_level
+        self.stt = stt
+        self.use_silero = use_silero
         self._stop = threading.Event()
         self.cancelled = False
         self.speech_detected = False
+        self.t_speech_end: float | None = None  # monotonic time of the last voiced chunk
+        self.t_end: float | None = None         # when recording stopped
+        self.text = ""
+        self.conf = 0.0
+        self.stt_sec = 0.0
+        self.vad_kind = ""
 
     def stop(self) -> None:
         self._stop.set()
@@ -148,11 +159,15 @@ class Recording:
 
     def run(self) -> bytes | None:
         """Blocking. Returns WAV bytes, or None if cancelled / no speech."""
+        from .vad import EndpointDetector
+        det = EndpointDetector(use_silero=self.use_silero)
+        self.vad_kind = det.kind
         sid, q = self.hub.subscribe()
         chunks: list = []
         start = time.monotonic()
-        noise = None
         last_voice = None
+        voiced_run = 0
+        stt_busy = 0.0
         try:
             while not self._stop.is_set():
                 try:
@@ -161,6 +176,7 @@ class Recording:
                     if time.monotonic() - start > self.max_sec:
                         break
                     continue
+                now = time.monotonic()
                 chunks.append(c)
                 lvl = rms_int16(c)
                 if self.on_level:
@@ -168,14 +184,22 @@ class Recording:
                         self.on_level(min(1.0, lvl / 4000.0))
                     except Exception:
                         pass
-                now = time.monotonic()
                 el = now - start
-                if noise is None or el < 0.4:
-                    noise = lvl if noise is None else (noise * 0.7 + lvl * 0.3)
-                thr = max(450.0, (noise or 0) * 2.5)
-                if lvl > thr and el > 0.15:
-                    self.speech_detected = True
-                    last_voice = now
+                if det.voiced(c, lvl, el):
+                    voiced_run += 1
+                    if voiced_run >= 2 or self.speech_detected:  # ≥160 ms: not a click / the beep
+                        self.speech_detected = True
+                        last_voice = now
+                else:
+                    voiced_run = 0
+                if self.stt is not None:
+                    t = time.monotonic()
+                    try:
+                        self.stt.feed(c)
+                    except Exception as e:
+                        log.warning("local stt feed failed: %s", e)
+                        self.stt = None
+                    stt_busy += time.monotonic() - t
                 if el > self.max_sec:
                     break
                 if self.auto_stop:
@@ -185,6 +209,8 @@ class Recording:
                         break
         finally:
             self.hub.unsubscribe(sid)
+        self.t_end = time.monotonic()
+        self.t_speech_end = last_voice if last_voice else self.t_end
         if self.cancelled or not chunks:
             return None
         if self.auto_stop and not self.speech_detected:
@@ -193,10 +219,95 @@ class Recording:
         pcm = np.concatenate(chunks).astype(np.int16)
         if pcm.size < SAMPLE_RATE * 0.3:
             return None
+        if self.stt is not None and self.speech_detected:
+            t = time.monotonic()
+            try:
+                self.text, self.conf = self.stt.final()
+            except Exception as e:
+                log.warning("local stt final failed: %s", e)
+            self.stt_sec = time.monotonic() - t
+            log.info("local stt: %r conf=%.2f (final %.0f ms, live feed %.2fs over %.1fs audio)",
+                     self.text[:120], self.conf, self.stt_sec * 1000, stt_busy, pcm.size / SAMPLE_RATE)
         return pcm_to_wav(pcm.tobytes())
 
 
-# ─── TTS (edge-tts) + MCI playback ───────────────────────────────────────────
+# ─── Text → sentences (for speaking a streamed reply as it arrives) ──────────
+
+_SENT_END = re.compile(r"([.!?…]+[»\")]*)(\s+)")
+
+
+class SentenceSplitter:
+    """push(delta) → complete sentences ready to speak; flush() → the rest.
+    Short fragments are glued to the next sentence; very long ones are cut at a comma.
+    The FIRST piece is also cut at a clause boundary (", " ": " " — ") once it is long enough:
+    the first sound comes sooner and its synthesis is shorter; the rest plays gaplessly after it."""
+
+    def __init__(self, min_len: int = 12, max_len: int = 220, first_clause: int = 28) -> None:
+        self.buf = ""
+        self.min_len = min_len
+        self.max_len = max_len
+        self.first_clause = first_clause
+        self.count = 0
+
+    def push(self, delta: str) -> list[str]:
+        self.buf += delta or ""
+        out: list[str] = []
+        while True:
+            cut = None
+            for m in _SENT_END.finditer(self.buf):
+                end = m.end(1)
+                head = self.buf[:end].strip()
+                # first sentence may be short («Привет!») — speed matters most there
+                if len(head) >= (2 if self.count == 0 else self.min_len) and not _is_abbrev(self.buf[:end]):
+                    cut = (end, m.end())
+                    break
+            if cut is None and self.count == 0 and self.first_clause and len(self.buf) > self.first_clause + 2:
+                m = _CLAUSE.search(self.buf, self.first_clause)
+                if m:
+                    cut = (m.start() + 1 if m.group(0).startswith((",", ";", ":")) else m.start(), m.end())
+            if cut is None and "\n" in self.buf:
+                i = self.buf.index("\n")
+                if self.buf[:i].strip():
+                    cut = (i, i + 1)
+            if cut is None and len(self.buf) > self.max_len:
+                i = max(self.buf.rfind(", ", 0, self.max_len), self.buf.rfind("; ", 0, self.max_len),
+                        self.buf.rfind(" — ", 0, self.max_len))
+                cut = (i + 1, i + 2) if i > 20 else (self.max_len, self.max_len)
+            if cut is None:
+                return out
+            sent = self.buf[:cut[0]].strip()
+            self.buf = self.buf[cut[1]:]
+            if sent:
+                out.append(sent)
+                self.count += 1
+
+    def flush(self) -> list[str]:
+        rest = self.buf.strip()
+        self.buf = ""
+        if rest:
+            self.count += 1
+            return [rest]
+        return []
+
+
+_CLAUSE = re.compile(r"[,;:]\s+|\s+[—–]\s+")
+_ABBREV = re.compile(r"(?:\b(?:т|т\.\s?е|т\.\s?к|т\.\s?д|т\.\s?п|т\.\s?н|др|пр|см|г|гг|ул|д|им|тыс|млн|млрд|руб|коп|мин|сек|стр|рис|напр)\.)$",
+                     re.IGNORECASE)
+
+
+def _is_abbrev(text: str) -> bool:
+    t = text.rstrip()
+    if re.search(r"\b[А-ЯA-Z]\.$", t):  # initials «А. С. Пушкин»
+        return True
+    return bool(_ABBREV.search(t))
+
+
+def split_sentences(text: str) -> list[str]:
+    sp = SentenceSplitter()
+    return sp.push(text) + sp.flush()
+
+
+# ─── TTS: local Piper (default) or edge-tts (online) → playback ──────────────
 
 _MD_RE = re.compile(r"[*_`#>\[\]]+")
 
@@ -243,45 +354,178 @@ class _MCI:
         return self._buf.value
 
 
-class Speaker:
-    """Queue of utterances spoken on a dedicated thread. stop() interrupts."""
+class VoiceTurn:
+    """Timestamps of one voice exchange (monotonic) for the latency log / UI."""
 
-    def __init__(self, get_settings, on_state=None) -> None:
+    def __init__(self, source: str = "voice") -> None:
+        self.source = source
+        self.t: dict[str, float] = {}
+        self.stt = ""          # "local" | "cloud" | "wake-local"
+        self.model = ""
+        self.cancelled = False
+        self.reported = False
+
+    def mark(self, name: str, at: float | None = None) -> None:
+        if name not in self.t:
+            self.t[name] = time.monotonic() if at is None else at
+
+    def breakdown(self) -> dict:
+        t = self.t
+        out: dict = {"stt_mode": self.stt, "model": self.model}
+
+        def d(a, b):
+            return round(t[b] - t[a], 3) if a in t and b in t else None
+        out["endpoint"] = d("speech_end", "rec_end")
+        out["stt"] = d("rec_end", "text")
+        out["llm_first"] = d("text", "llm_first")
+        out["first_sentence"] = d("text", "sentence")
+        out["tts"] = d("sentence", "synth")
+        out["play"] = d("synth", "play")
+        out["first_audio"] = d("speech_end", "play")
+        out["text_to_audio"] = d("text", "play")
+        return out
+
+
+class _Clip:
+    __slots__ = ("pcm", "sr", "path", "text")
+
+    def __init__(self, text: str, pcm=None, sr: int = 0, path: str | None = None) -> None:
+        self.text, self.pcm, self.sr, self.path = text, pcm, sr, path
+
+
+class SpeechStream:
+    """Sentences of one reply. feed() as text arrives, end() when done. Stale after Speaker.stop()."""
+
+    def __init__(self, speaker: "Speaker", gen: int, turn: VoiceTurn | None) -> None:
+        self.sp, self.gen, self.turn = speaker, gen, turn
+        self.closed = False
+
+    def feed(self, text: str) -> None:
+        self.sp._enqueue(self, text)
+
+    def end(self) -> None:
+        self.sp._end_stream(self)
+
+
+class Speaker:
+    """Two-stage pipeline: synth thread (Piper or edge-tts) → player thread (sounddevice / MCI).
+    The next sentence is synthesized while the current one plays. stop() interrupts everything."""
+
+    def __init__(self, get_settings, on_state=None, on_turn=None, piper=None) -> None:
         self.get_settings = get_settings
         self.on_state = on_state  # callable(bool speaking)
-        self._q: queue.Queue = queue.Queue()
-        self._stop_flag = threading.Event()
+        self.on_turn = on_turn    # callable(VoiceTurn) when its first audio starts
+        self.piper = piper
+        self.silent = False       # tests: play zeros (device still opened, timings real)
+        self.null_output = False  # tests without a sound card: no device, real-time sleep instead
+        self._lock = threading.Lock()
+        self._gen = 0
+        self._pending = 0          # sentences queued/synthesizing/playing (current gen)
+        self._open: set[int] = set()
+        self._q_text: queue.Queue = queue.Queue()
+        self._q_audio: queue.Queue = queue.Queue()
+        self._stop_evt = threading.Event()
         self._busy = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="tts", daemon=True)
-        self._thread.start()
+        self._out = None
+        self._out_sr = 0
+        self._playing = False
+        self.last_engine = ""
         ensure_dir(TMP_DIR)
+        threading.Thread(target=self._synth_loop, name="tts-synth", daemon=True).start()
+        threading.Thread(target=self._play_loop, name="tts-play", daemon=True).start()
 
     @property
     def speaking(self) -> bool:
         return self._busy.is_set()
 
-    def say(self, text: str, *, interrupt: bool = False) -> None:
+    @property
+    def idle(self) -> bool:
+        """Nothing queued, synthesizing or playing, and no reply stream open."""
+        with self._lock:
+            return self._pending == 0 and not self._open and not self._playing
+
+    # ── public ──
+    def open_stream(self, turn: VoiceTurn | None = None) -> SpeechStream:
+        with self._lock:
+            st = SpeechStream(self, self._gen, turn)
+            self._open.add(id(st))
+            return st
+
+    def say(self, text: str, *, interrupt: bool = False, turn: VoiceTurn | None = None) -> None:
         t = speakable(text)
         if not t:
             return
         if interrupt:
             self.stop()
-        self._q.put(t)
+        st = self.open_stream(turn)
+        for s in split_sentences(t):
+            st.feed(s)
+        st.end()
+
+    def prewarm(self, sr: int = 22050) -> None:
+        """Open the output device while the model is still thinking (saves ~50–150 ms on Windows)."""
+        if not self.null_output and self.engine_for(self.get_settings()) == "piper":
+            self._q_audio.put(("prewarm", sr))
 
     def stop(self) -> None:
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
-        if self._busy.is_set():
-            self._stop_flag.set()
+        with self._lock:
+            self._gen += 1
+            self._open.clear()
+            self._pending = 0
+            for q in (self._q_text, self._q_audio):
+                try:
+                    while True:
+                        item = q.get_nowait()
+                        if item and len(item) > 2 and isinstance(item[2], _Clip) and item[2].path:
+                            _rm(item[2].path)
+                except queue.Empty:
+                    pass
+            busy = self._busy.is_set()
+            playing = self._playing
+        if busy:
+            self._stop_evt.set()
+            if not playing:  # waiting between sentences → nothing will report the end
+                self._set_state(False)
 
     def shutdown(self) -> None:
         self.stop()
-        self._q.put(None)
+        self._q_text.put(None)
+        self._q_audio.put(None)
+
+    # ── internals ──
+    def _enqueue(self, st: SpeechStream, text: str) -> None:
+        t = speakable(text)
+        if not t:
+            return
+        with self._lock:
+            if st.gen != self._gen or st.closed:
+                return
+            self._pending += 1
+        if st.turn:
+            st.turn.mark("sentence")
+        self._q_text.put((st.gen, st, t))
+
+    def _end_stream(self, st: SpeechStream) -> None:
+        with self._lock:
+            st.closed = True
+            self._open.discard(id(st))
+            idle = self._pending == 0 and not self._open
+        if idle and self._busy.is_set():
+            self._set_state(False)
+
+    def _done_one(self, gen: int) -> None:
+        with self._lock:
+            if gen == self._gen and self._pending > 0:
+                self._pending -= 1
+            idle = self._pending == 0 and not self._open
+        if idle:
+            self._close_out(drain=True)
+            if self._busy.is_set():
+                self._set_state(False)
 
     def _set_state(self, v: bool) -> None:
+        if v == self._busy.is_set():
+            return
         if v:
             self._busy.set()
         else:
@@ -292,37 +536,181 @@ class Speaker:
             except Exception:
                 pass
 
-    def _run(self) -> None:
-        mci = None
-        while True:
-            text = self._q.get()
-            if text is None:
-                return
-            self._stop_flag.clear()
-            s = self.get_settings()
-            fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3", dir=TMP_DIR)
-            os.close(fd)
+    def engine_for(self, s: dict) -> str:
+        if s.get("tts_engine", "piper") == "piper" and self.piper is not None \
+                and self.piper.ready(s.get("piper_voice") or ""):
+            return "piper"
+        return "edge"
+
+    def synth_clip(self, text: str, s: dict) -> _Clip:
+        """Synthesize one sentence with the configured engine; falls back to the other one."""
+        eng = self.engine_for(s)
+        order = [eng] + (["edge"] if eng == "piper" else (["piper"] if self.piper is not None
+                                                            and self.piper.ready(s.get("piper_voice") or "") else []))
+        last: Exception | None = None
+        for e in order:
             try:
-                self._set_state(True)
-                synth_to_file(text, s.get("voice", "ru-RU-DmitryNeural"),
-                              int(s.get("tts_rate", 0)), path)
-                if self._stop_flag.is_set():
-                    continue
-                if IS_WIN:
-                    if mci is None:
-                        mci = _MCI()
-                    self._play_mci(mci, path, int(s.get("tts_volume", 85)))
+                if e == "piper":
+                    pcm, sr = self.piper.synth(text, s.get("piper_voice"), int(s.get("tts_rate", 0)))
+                    self.last_engine = "piper"
+                    return _Clip(text, pcm=pcm, sr=sr)
+                fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3", dir=TMP_DIR)
+                os.close(fd)
+                try:
+                    synth_to_file(text, s.get("voice", "ru-RU-DmitryNeural"), int(s.get("tts_rate", 0)), path)
+                except Exception:
+                    _rm(path)
+                    raise
+                self.last_engine = "edge"
+                return _Clip(text, path=path)
+            except Exception as ex:
+                last = ex
+                log.warning("TTS %s failed: %s", e, ex)
+        raise RuntimeError(f"TTS failed: {last}")
+
+    def _synth_loop(self) -> None:
+        while True:
+            item = self._q_text.get()
+            if item is None:
+                return
+            gen, st, text = item
+            # stay at most ~2 sentences ahead of playback (no wasted CPU on a reply that gets interrupted)
+            while self._q_audio.qsize() >= 2 and gen == self._gen:
+                time.sleep(0.02)
+            if gen != self._gen:
+                continue
+            try:
+                t0 = time.monotonic()
+                clip = self.synth_clip(text, self.get_settings())
+                if st.turn:
+                    st.turn.mark("synth")
+                log.debug("tts %s %.2fs: %s", self.last_engine, time.monotonic() - t0, text[:60])
             except Exception as e:
                 log.warning("TTS failed: %s", e)
-            finally:
-                if self._q.empty():
-                    self._set_state(False)
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                self._done_one(gen)
+                continue
+            if gen != self._gen:
+                if clip.path:
+                    _rm(clip.path)
+                continue
+            self._q_audio.put((gen, st, clip))
 
-    def _play_mci(self, mci: _MCI, path: str, volume: int) -> None:
+    def _play_loop(self) -> None:
+        mci = None
+        while True:
+            try:
+                item = self._q_audio.get(timeout=1.0)
+            except queue.Empty:
+                with self._lock:
+                    idle = self._pending == 0 and not self._open
+                if idle:
+                    self._close_out(drain=True)
+                continue
+            if item is None:
+                self._close_out(drain=False)
+                return
+            if item[0] == "prewarm":
+                try:
+                    self._open_out(item[1])
+                except Exception as e:
+                    log.debug("prewarm failed: %s", e)
+                continue
+            gen, st, clip = item
+            if gen != self._gen:
+                if clip.path:
+                    _rm(clip.path)
+                continue
+            self._stop_evt.clear()
+            self._playing = True
+            self._set_state(True)
+            s = self.get_settings()
+            vol = 0 if self.silent else int(s.get("tts_volume", 85))
+            try:
+                if clip.pcm is not None:
+                    self._play_pcm(clip, vol, st)
+                elif clip.path and IS_WIN:
+                    if mci is None:
+                        mci = _MCI()
+                    self._close_out(drain=True)
+                    self._play_mci(mci, clip.path, vol, st)
+                elif st.turn:
+                    st.turn.mark("play")
+                    self._report(st.turn)
+            except Exception as e:
+                log.warning("playback failed: %s", e)
+                self._close_out(drain=False)
+            finally:
+                self._playing = False
+                if clip.path:
+                    _rm(clip.path)
+                if self._stop_evt.is_set():
+                    self._close_out(drain=False)
+                self._done_one(gen)
+
+    def _report(self, turn: VoiceTurn | None) -> None:
+        if turn is not None and not turn.reported:
+            turn.reported = True
+            if self.on_turn:
+                try:
+                    self.on_turn(turn)
+                except Exception:
+                    log.exception("on_turn failed")
+
+    def _play_pcm(self, clip: _Clip, volume: int, st: SpeechStream) -> None:
+        import numpy as np
+        data = clip.pcm
+        if self.null_output:
+            if st.turn:
+                st.turn.mark("play")
+                self._report(st.turn)
+            end = time.monotonic() + len(data) / float(clip.sr)
+            while time.monotonic() < end and not self._stop_evt.is_set() and st.gen == self._gen:
+                time.sleep(0.02)
+            return
+        if volume < 100:
+            data = (data.astype(np.float32) * (max(0, volume) / 100.0)).astype(np.int16)
+        if self._out is not None and self._out_sr != clip.sr:
+            self._close_out(drain=True)
+        if self._out is None:
+            self._open_out(clip.sr)
+            data = np.concatenate([np.zeros(int(clip.sr * 0.03), dtype=np.int16), data])  # device warm-up
+        block = 1024
+        first = True
+        for i in range(0, len(data), block):
+            if self._stop_evt.is_set() or st.gen != self._gen:
+                self._stop_evt.set()
+                return
+            self._out.write(data[i:i + block])
+            if first:
+                first = False
+                if st.turn:
+                    st.turn.mark("play")
+                    self._report(st.turn)
+
+    def _open_out(self, sr: int) -> None:
+        if self._out is not None and self._out_sr == sr:
+            return
+        self._close_out(drain=True)
+        import sounddevice as sd
+        out = sd.OutputStream(samplerate=sr, channels=1, dtype="int16", latency="low")
+        out.start()
+        self._out, self._out_sr = out, sr
+
+    def _close_out(self, drain: bool) -> None:
+        out = self._out
+        if out is None:
+            return
+        self._out = None
+        try:
+            if drain:
+                out.stop()   # waits for queued audio
+            else:
+                out.abort()  # interrupt now
+            out.close()
+        except Exception:
+            pass
+
+    def _play_mci(self, mci: _MCI, path: str, volume: int, st: SpeechStream) -> None:
         alias = "jarvis_tts"
         try:
             mci.cmd(f"close {alias}")
@@ -335,9 +723,12 @@ class Speaker:
             except Exception:
                 pass
             mci.cmd(f"play {alias}")
+            if st.turn:
+                st.turn.mark("play")
+                self._report(st.turn)
             t0 = time.monotonic()
-            while not self._stop_flag.is_set():
-                time.sleep(0.05)
+            while not self._stop_evt.is_set() and st.gen == self._gen:
+                time.sleep(0.03)
                 try:
                     mode = mci.cmd(f"status {alias} mode")
                 except Exception:
@@ -355,6 +746,13 @@ class Speaker:
                 mci.cmd(f"close {alias}")
             except Exception:
                 pass
+
+
+def _rm(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ─── Beeps ───────────────────────────────────────────────────────────────────
