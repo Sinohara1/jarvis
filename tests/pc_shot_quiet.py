@@ -24,6 +24,7 @@ hwnd = found[0]
 was_visible = u.IsWindowVisible(hwnd)
 SWP = 0x0001 | 0x0004 | 0x0010  # NOSIZE | NOZORDER | NOACTIVATE
 r = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(r))
+ox, oy = r.left, r.top
 if not was_visible:
     u.SetWindowPos(hwnd, 0, -5000, 50, 0, 0, SWP)
     u.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
@@ -44,5 +45,6 @@ img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
 g.DeleteObject(bmp); g.DeleteDC(mdc); u.ReleaseDC(hwnd, hdc)
 if not was_visible:
     u.ShowWindow(hwnd, 0)  # back to tray
+    u.SetWindowPos(hwnd, 0, ox, oy, 0, 0, SWP)  # restore position so it opens on-screen later
 img.save(sys.argv[1])
 print("saved", img.size, "printwindow ok" if ok else "printwindow failed", "was_visible", bool(was_visible))
