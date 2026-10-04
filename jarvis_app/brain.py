@@ -13,6 +13,7 @@ from datetime import datetime
 from . import providers as P
 from .actions import TOOLS, time_info
 from . import persona
+from . import lang as L
 from .config import PROVIDERS, api_key_for
 
 log = logging.getLogger("jarvis")
@@ -28,7 +29,7 @@ SYSTEM_PROMPT = """Ты — {name}, личный голосовой ИИ-асс�
 Правила ответа:
 - Твои ответы озвучиваются голосом. Отвечай коротко и разговорно: обычно 1–2 предложения, максимум 3–4, если просят объяснить.
 - Никакого markdown, списков, эмодзи и ссылок в тексте. Числа и время пиши так, как их удобно произносить.
-- Отвечай по-русски, если не попросили иначе.
+- {lang_rule}
 - Если нужно действие на компьютере — вызывай инструменты, а не описывай, как это сделать. После действия коротко подтверди.
 - Когда пользователь говорит, чем сейчас занимается и сколько времени («делаю домашку по физике 40 минут») — сразу вызывай start_focus.
 - Ты не умеешь удалять файлы, закрывать программы и отправлять сообщения. Если просят — честно скажи, что пока так не умеешь.
@@ -41,7 +42,7 @@ def build_system_prompt(settings: dict) -> str:
     user = str(settings.get("user_name") or "").strip()
     name = persona.assistant_name(settings)
     head = SYSTEM_PROMPT.format(
-        name=name, character=persona.character_text(settings),
+        name=name, character=persona.character_text(settings), lang_rule=L.prompt_rule(settings),
         user_gen=f"пользователя по имени {user}" if user else "пользователя",
         user_dat=f"пользователю ({user})" if user else "пользователю")
     if user:
@@ -63,7 +64,7 @@ VOICE_HINT = ("\nЭто голосовая реплика: запрос расп
               "(окончания, слитные слова) — понимай по смыслу и не переспрашивай из-за них. Ответ сразу озвучивается: "
               "одно короткое предложение, максимум два (до 25 слов), сразу по сути, без вступлений, меток вроде «Короткий ответ:» и повторения вопроса.\n"
               "Если нужен инструмент: в том же ответе сначала скажи одну очень короткую фразу о том, что делаешь "
-              "(«Открываю ютуб.», «Ставлю напоминание.»), и сразу вызови инструмент. После успешного выполнения ничего "
+              "на языке ответа («Открываю ютуб.», «Opening YouTube.»), и сразу вызови инструмент. После успешного выполнения ничего "
               "не повторяй (ответь пустой строкой); говори, только если результат важен: нашёл файлы, ошибка, вопрос.\n")
 NO_TOOLS_HINT = ("\nСейчас инструменты недоступны. Если для ответа нужно действие на компьютере (открыть программу, сайт "
                  "или файл, поиск в интернете, найти файл, напоминание или таймер, фокус-сессия, посмотреть на экран, "
@@ -109,6 +110,7 @@ class Brain:
         self.lite_cooldown_until = 0.0
         self.last_model = ""
         self.current_model = ""
+        self._lang = "ru"  # language of the current reply (for the app's own fallback phrases)
 
     # ── provider plumbing ──
     def provider(self, name: str | None = None) -> P.Provider:
@@ -148,10 +150,10 @@ class Brain:
                       "«Открыть …?» и вызывай инструмент только после явного «да».\n")
         return (build_system_prompt(st) + extra
                 + f"\nСейчас: {ti['weekday']}, {ti['date']}, {ti['time']}.\n"
-                + (ctx + "\n" if ctx else "") + (VOICE_HINT if voice else ""))
+                + (ctx + "\n" if ctx else "") + (VOICE_HINT if voice else "") + L.turn_rule(st, self._lang))
 
     # ── speech to text ──
-    def transcribe(self, wav: bytes) -> str:
+    def transcribe(self, wav: bytes, lang: str = "ru") -> str:
         """Gemini (inline audio) when a Gemini key exists, else OpenAI Whisper."""
         s = self.get_settings()
         plan: list[tuple[str, list[str]]] = []
@@ -171,7 +173,7 @@ class Brain:
             for model in models:
                 try:
                     t0 = time.monotonic()
-                    text = prov.transcribe(model, wav, timeout=30)
+                    text = prov.transcribe(model, wav, timeout=30, lang=lang)
                     log.info("transcribed via %s/%s in %.1fs: %r", name, model,
                              time.monotonic() - t0, text[:120])
                     return text
@@ -181,11 +183,13 @@ class Brain:
         raise last or P.ProviderError("Не удалось распознать речь")
 
     # ── chat with tools ──
-    def ask(self, text: str, on_tool=None, on_text=None, *, fast: bool = False, voice: bool = False) -> str:
+    def ask(self, text: str, on_tool=None, on_text=None, *, fast: bool = False, voice: bool = False,
+            lang: str | None = None) -> str:
         """One user turn. on_text(delta) streams the visible reply as it arrives (all tool rounds).
         fast=True → lite model first (voice turns with «Быстрые ответы»), chat model as fallback."""
         with self.lock:
             s = self.get_settings()
+            self._lang = lang or L.reply_lang(s, L.detect(text, prefer=L.speech_lang(s)))
             pname = s["provider"]
             if self._hist_provider != pname:
                 self.history = []
@@ -278,7 +282,7 @@ class Brain:
             if res is not None:
                 if res.raw_message is not None:
                     self.history.append(res.raw_message)
-                return res.text.replace(ESCAPE, "").strip() or "Готово."
+                return res.text.replace(ESCAPE, "").strip() or L.text("ok", self._lang)
         for _round in range(MAX_TOOL_ROUNDS):
             res = self._call(prov, chat_m, lite_m, on_text, fast=fast, voice=voice)
             if res.raw_message is not None:
@@ -286,7 +290,7 @@ class Brain:
             if res.text:
                 said.append(res.text)
             if not res.tool_calls:
-                return " ".join(said).strip() or "Готово."
+                return " ".join(said).strip() or L.text("ok", self._lang)
             results = []
             for c in res.tool_calls:
                 if on_tool:
@@ -296,7 +300,7 @@ class Brain:
                         pass
                 results.append(self.actions.execute(c.name, c.args))
             self.history.extend(prov.tool_result_messages(res.tool_calls, results))
-        return " ".join(said).strip() or "Сделал, что смог."
+        return " ".join(said).strip() or L.text("did", self._lang)
 
     def _try_without_tools(self, prov, chat_m, lite_m, on_text, *, fast: bool) -> P.LLMResult | None:
         """Fast path for plain questions. Returns None if the model asked for tools ([[TOOLS]])."""
@@ -354,7 +358,7 @@ class Brain:
         prov = self.provider(pname)
         chat_m, lite_m = self.models(pname)
         prompt = (f"Это скриншот экрана пользователя. Вопрос: {question}\n"
-                  "Ответь по-русски коротко (1–3 предложения), как для озвучки, обращаясь на «ты».")
+                  f"{L.prompt_rule(s)} Ответь коротко (1–3 предложения), как для озвучки, обращаясь на «ты».")
         last: Exception | None = None
         for model in (lite_m, chat_m):
             try:

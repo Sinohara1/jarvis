@@ -33,16 +33,21 @@ def run() -> int:
     def piper_check():
         from . import tts_local
         import piper  # noqa: F401  (bundled engine + espeak-ng data)
-        key = s.get("piper_voice") or tts_local.DEFAULT_VOICE
+        from . import lang as L
+        code = L.reply_lang(s, L.speech_lang(s))
+        key = tts_local.voice_for_lang(s, code) or tts_local.DEFAULT_VOICE
         ed = tts_local.espeak_dir()
+        langs = sorted({tts_local.voice_lang(k) for k in tts_local.PIPER_VOICES if tts_local.installed(k)})
+        own = len(tts_local.list_custom())
         if not tts_local.installed(key):
-            return f"engine ok (espeak {'bundled' if ed else 'package'}); voice {key} not downloaded yet"
+            return (f"engine ok (espeak {'bundled' if ed else 'package'}); voice {key} ({code}) not downloaded yet; "
+                    f"installed: {','.join(langs) or '-'}, own {own}")
         eng = tts_local.PiperTTS()
         t0 = time.monotonic()
         eng.load(key)
         load = time.monotonic() - t0
         t0 = time.monotonic()
-        pcm, sr = eng.synth("Привет! Это проверка локального голоса.", key, int(s.get("tts_rate", 0)))
+        pcm, sr = eng.synth(L.preview_text(code, "Jarvis"), key, int(s.get("tts_rate", 0)))
         syn = time.monotonic() - t0
         import numpy as np
         import sounddevice as sd
@@ -50,7 +55,7 @@ def run() -> int:
         with sd.OutputStream(samplerate=sr, channels=1, dtype="int16", latency="low") as out:  # zeros: silent
             out.write(np.zeros(int(sr * 0.2), dtype=np.int16))
         dev = time.monotonic() - t0
-        return (f"{key}: load {load:.2f}s, synth {syn:.3f}s for {pcm.size / sr:.1f}s audio "
+        return (f"[{code}; voices for {','.join(langs) or '-'}; own {own}] {key}: load {load:.2f}s, synth {syn:.3f}s for {pcm.size / sr:.1f}s audio "
                 f"(RTF {syn / max(0.01, pcm.size / sr):.3f}), output device open+0.2s zeros {dev:.2f}s")
 
     def vad_check():

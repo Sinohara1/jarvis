@@ -352,19 +352,25 @@ class Bridge:
         return {"ok": ok, "tts": self._core.tts_info()}
 
     def test_voice(self, voice: str = "", rate: int | None = None, volume: int | None = None,
-                   engine: str = "", piper_voice: str = "") -> dict:
-        """Preview. Local voice not downloaded yet → start the download and report it."""
+                   engine: str = "", piper_voice: str = "", lang: str = "") -> dict:
+        """Preview in a language. Local voice not downloaded yet → start the download and report it."""
+        from . import lang as L
         from . import tts_local
         sp = self._core.speaker
         tmp = copy.deepcopy(self._core.settings)
+        code = L.norm(lang) if lang else self._core._reply_lang()
         if engine in ("piper", "edge"):
             tmp["tts_engine"] = engine
         if piper_voice:
-            tmp["piper_voice"] = piper_voice
-        if tmp["tts_engine"] == "piper" and not tts_local.installed(tmp["piper_voice"]):
-            self._core.download_voice(tmp["piper_voice"])
-            return {"ok": False, "downloading": tmp["piper_voice"], "tts": self._core.tts_info()}
-        if voice:
+            if code == "ru":
+                tmp["piper_voice"] = piper_voice
+            else:
+                tmp["piper_voices"] = dict(tmp.get("piper_voices") or {}, **{code: piper_voice})
+        key = tts_local.voice_for_lang(tmp, code)
+        if tmp["tts_engine"] == "piper" and not tts_local.installed(key):
+            self._core.download_voice(key)
+            return {"ok": False, "downloading": key, "tts": self._core.tts_info()}
+        if voice and code == "ru":
             tmp["voice"] = voice
         if rate is not None:
             tmp["tts_rate"] = int(rate)
@@ -372,13 +378,46 @@ class Bridge:
             tmp["tts_volume"] = int(volume)
         sp.get_settings = lambda: tmp
         user = str(self._core.settings.get("user_name") or "").strip()
-        self._core.say(f"Привет{', ' + user if user else ''}. Я {self._name()}. Так звучит мой голос.", interrupt=True)
+        self._core.say(L.preview_text(code, self._name(), user), interrupt=True, lang=code)
 
         def restore() -> None:
             time.sleep(10)
             sp.get_settings = lambda: self._core.settings
         threading.Thread(target=restore, daemon=True).start()
-        return {"ok": True, "engine": sp.engine_for(tmp)}
+        return {"ok": True, "engine": sp.engine_for(tmp, code)}
+
+    def pick_voice_file(self, kind: str = "voice") -> str:
+        """Native file dialog: a Piper voice (.onnx / .zip) or, if asked, its .onnx.json."""
+        import webview
+        types = (("Настройки голоса (*.json)", "Все файлы (*.*)") if kind == "json"
+                 else ("Голос Piper (*.onnx;*.zip)", "Все файлы (*.*)"))
+        try:
+            fd = getattr(webview, "FileDialog", None)
+            mode = fd.OPEN if fd is not None else webview.OPEN_DIALOG  # pywebview 5+ / older
+            res = self._window.create_file_dialog(mode, allow_multiple=False, file_types=types)
+        except Exception as e:
+            log.warning("file dialog failed: %s", e)
+            return ""
+        if not res:
+            return ""
+        return str(res[0] if isinstance(res, (list, tuple)) else res)
+
+    def import_voice(self, path: str = "", json_path: str = "") -> dict:
+        """«Загрузить свой голос»: path empty → open the file dialog first."""
+        path = path or self.pick_voice_file("voice")
+        if not path:
+            return {"ok": False, "cancelled": True}
+        r = self._core.import_voice(path, json_path or None)
+        r["path"] = path
+        r["tts"] = self._core.tts_info()
+        r["settings"] = self._settings_payload()
+        return r
+
+    def delete_voice(self, key: str) -> dict:
+        r = self._core.delete_voice(str(key or ""))
+        r["tts"] = self._core.tts_info()
+        r["settings"] = self._settings_payload()
+        return r
 
     # focus
     def focus_start(self, task: str, minutes=None, rounds=None, break_minutes=None) -> dict:

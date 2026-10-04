@@ -404,9 +404,10 @@ def test_piper_catalog_and_rate():
     from jarvis_app import tts_local as T
     assert T.DEFAULT_VOICE in T.PIPER_VOICES and len(T.PIPER_VOICES) >= 4
     for k, v in T.PIPER_VOICES.items():
-        assert k.startswith("ru_RU-") and len(v["md5"]) == 32 and len(v["md5_json"]) == 32, k
+        assert k[:2] == v["lang"] and len(v["md5"]) == 32 and len(v["md5_json"]) == 32, k
+        assert T.KEY_RE.fullmatch(k) and v["path"].startswith(v["lang"] + "/"), k
         on, js = T.voice_files(k, root="/nonexistent")
-        assert on.endswith(k + ".onnx") and js.endswith(".onnx.json")
+        assert on.endswith(T.file_key(k) + ".onnx") and js.endswith(".onnx.json")
         assert not T.installed(k, root="/nonexistent")
     for edge, piper in T.EDGE_TO_PIPER.items():
         assert piper in T.PIPER_VOICES, (edge, piper)

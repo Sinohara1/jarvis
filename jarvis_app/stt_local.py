@@ -1,4 +1,5 @@
-"""Local speech-to-text with Vosk (the same small Russian model the name wake word uses).
+"""Local speech-to-text with Vosk: small model per spoken language (ru shared with the name wake word;
+uk/en/de/pl downloaded on demand, ~40–80 MB each, into %LOCALAPPDATA%\\Jarvis\\models).
 
 The recognizer is fed *while* the user speaks, so when the pause is detected the text is ready
 in ~10–50 ms instead of a 1–2 s round trip to Gemini, and the voice turn costs one API request
@@ -29,13 +30,42 @@ def get_model(path: str):
         return m
 
 
-def model_path() -> str | None:
+def model_name(code: str = "ru") -> str:
+    from .lang import LANGS, norm
+    return LANGS[norm(code)]["vosk"][0]
+
+
+def model_path(code: str = "ru") -> str | None:
     from .namewake import find_model
-    return find_model()
+    return find_model(model_name(code))
 
 
-def is_loaded() -> bool:
-    return bool(_models)
+def download(code: str, on_progress=None) -> str:
+    from .lang import LANGS, norm
+    from .namewake import download_model
+    name, size = LANGS[norm(code)]["vosk"]
+    return download_model(on_progress, url=f"https://alphacephei.com/vosk/models/{name}.zip", name=name, size=size)
+
+
+def is_loaded(code: str | None = None) -> bool:
+    if code is None:
+        return bool(_models)
+    p = model_path(code)
+    return bool(p) and p in _models
+
+
+def transcribe_wav(model, wav: bytes) -> tuple[str, float]:
+    """Decode a whole recorded WAV (e.g. the request said right after the wake name)."""
+    import io
+    import wave
+    with wave.open(io.BytesIO(wav)) as w:
+        if w.getframerate() != 16000 or w.getnchannels() != 1:
+            return "", 0.0
+        data = w.readframes(w.getnframes())
+    st = StreamingSTT(model)
+    for i in range(0, len(data), 2560):
+        st.feed(data[i:i + 2560])
+    return st.final()
 
 
 class StreamingSTT:

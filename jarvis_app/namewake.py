@@ -129,9 +129,9 @@ def _valid_model(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "am", "final.mdl")) and os.path.isdir(os.path.join(path, "graph"))
 
 
-def find_model() -> str | None:
+def find_model(name: str = VOSK_MODEL_NAME) -> str | None:
     for root in (USER_MODELS_DIR, MODELS_DIR):
-        p = os.path.join(root, VOSK_MODEL_NAME)
+        p = os.path.join(root, name)
         if _valid_model(p):
             return p
     return None
@@ -140,11 +140,12 @@ def find_model() -> str | None:
 _dl_lock = threading.Lock()
 
 
-def download_model(on_progress=None, url: str = VOSK_MODEL_URL, dest_root: str = USER_MODELS_DIR) -> str:
-    """Download + unpack the Vosk model once. on_progress(done, total). Returns the model dir."""
+def download_model(on_progress=None, url: str = VOSK_MODEL_URL, dest_root: str = USER_MODELS_DIR,
+                   name: str = VOSK_MODEL_NAME, size: int = VOSK_MODEL_SIZE) -> str:
+    """Download + unpack a Vosk model once. on_progress(done, total). Returns the model dir."""
     import requests
     with _dl_lock:
-        final = os.path.join(dest_root, VOSK_MODEL_NAME)
+        final = os.path.join(dest_root, name)
         if _valid_model(final):
             return final
         ensure_dir(dest_root)
@@ -153,7 +154,7 @@ def download_model(on_progress=None, url: str = VOSK_MODEL_URL, dest_root: str =
             zpath = os.path.join(tmpdir, "model.zip")
             with requests.get(url, stream=True, timeout=30) as r:
                 r.raise_for_status()
-                total = int(r.headers.get("Content-Length") or 0) or VOSK_MODEL_SIZE
+                total = int(r.headers.get("Content-Length") or 0) or size
                 done, last = 0, 0.0
                 with open(zpath, "wb") as f:
                     for chunk in r.iter_content(256 * 1024):
@@ -172,7 +173,7 @@ def download_model(on_progress=None, url: str = VOSK_MODEL_URL, dest_root: str =
                     if m.startswith("/") or ".." in m.split("/"):
                         raise RuntimeError("подозрительный путь в архиве")
                 z.extractall(tmpdir)
-            src = os.path.join(tmpdir, VOSK_MODEL_NAME)
+            src = os.path.join(tmpdir, name)
             if not _valid_model(src):
                 raise RuntimeError("в архиве нет модели")
             if os.path.exists(final):

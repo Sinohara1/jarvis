@@ -310,3 +310,9 @@ body.maximized .rz { display: none; }
 .pchip.on { background: #f2f2f2; color: #111; border-color: #f2f2f2; box-shadow: 0 4px 16px rgba(255,255,255,.12); }
 .vsug { margin-top: 10px; border-top: none !important; background: rgba(0,0,0,.18); border-radius: 12px; padding: 8px 12px; }
 .msg.jarvis .av { margin-top: 17px; }
+
+/* v1.4 voice languages */
+.inp.ro { display: flex; align-items: center; color: #bdbdbd; font-size: 12.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.row.own .btn + .btn { margin-left: 6px; }
+#v-ownlist .row.own { padding: 8px 0; }
+.note a { color: var(--accent, #9ecbff); }

@@ -105,6 +105,7 @@ function onEvent(e, d) {
       if (was && !d.downloading) { if (d.error) toast(d.error, 'err', 7000); else { toast(`Голос «${pvLabel(was)}» скачан — теперь говорю офлайн`, '', 2600); if (S.tab === 'voice') buildVoice(); } }
       break; }
     case 'tts_dl': S.ttsDl = d; renderTtsStatus(); break;
+    case 'stt_dl': S.sttDl = d; renderTtsStatus(); break;
     case 'voice_timing': S.tts.timing = d; renderTtsStatus(); break;
     case 'tool': addMsg({ role: 'tool', text: d.label }); break;
     case 'focus': case 'tick': if (d.focus) { S.focus = d.focus; renderFocusLive(); } break;
@@ -424,22 +425,50 @@ function buildModel() {
   $('#m-test').onclick = async () => { $('#m-res').textContent = 'Проверяю…'; const r = await API.test_ai(p, collect()); $('#m-res').textContent = r; };
 }
 
+const ANSWER_LANGS = [['auto', 'Как я спросил'], ['ru', 'Русский'], ['uk', 'Українська'], ['en', 'English'], ['de', 'Deutsch'], ['pl', 'Polski']];
+const LANG_NAME = { ru: 'Русский', uk: 'Українська', en: 'English', de: 'Deutsch', pl: 'Polski' };
+function voiceLang() { const t = S.tts || {}; return S.voiceLang || t.reply_lang || 'ru'; }
+function voiceChoice(code) { const s = S.settings; const t = S.tts || {}; return (t.voice_for || {})[code] || (code === 'ru' ? s.piper_voice : ''); }
+function voicePatch(code, key) { return code === 'ru' ? { piper_voice: key } : { piper_voices: { [code]: key } }; }
+function langOpts(list, cur) { return list.map(([k, l]) => `<option value="${k}" ${k === cur ? 'selected' : ''}>${esc(l)}</option>`).join(''); }
 function buildVoice() {
   const s = S.settings; const t = S.tts || { voices: [] };
   const local = s.tts_engine !== 'edge';
   const pvs = t.voices || [];
+  const vl = voiceLang();
+  const cur = voiceChoice(vl);
+  const off = pvs.filter((v) => v.lang === vl && !v.custom);
+  const own = pvs.filter((v) => v.lang === vl && v.custom);
+  const allOwn = pvs.filter((v) => v.custom);
+  const opt = (v) => `<option value="${esc(v.key)}" ${v.key === cur ? 'selected' : ''}>${esc(v.label)}${v.gender ? ` (${v.gender === 'ж' ? 'жен.' : 'муж.'})` : ''}${v.installed ? '' : ` — скачать ~${v.mb || 60} МБ`}</option>`;
+  const edgeSel = vl === 'ru' ? `<select id="v-voice" class="inp">${S.voices.map((v) => `<option ${v === s.voice ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`
+    : `<div class="inp ro" id="v-voice-ro">${esc(EDGE_AUTO[vl] || '')}</div>`;
   $('#p-voice').innerHTML = head('Голос', `Как ${esc(NM())} слушает и говорит.`) +
-    `<div class="card sect"><h3>${icon('vol', 15)}Голос ассистента</h3>
+    `<div class="card sect" id="v-langcard"><h3>${icon('globe', 15)}Язык<span class="badge">новое</span></h3>
+      <div class="row"><div class="grow"><div class="t">Язык ответов</div><div class="s">Текст и голос: ответы в чате, живой режим, страж фокуса, напоминания, короткие фразы вроде «Открываю». Интерфейс остаётся русским</div></div>
+        <select id="v-alang" class="inp" style="max-width:200px">${langOpts(ANSWER_LANGS, s.answer_lang || 'ru')}</select></div>
+      <div class="row"><div class="grow"><div class="t">Язык, на котором я говорю</div><div class="s" id="v-sttlang"></div></div>
+        <select id="v-slang" class="inp" style="max-width:200px">${langOpts(ANSWER_LANGS.slice(1), s.speech_lang || 'ru')}</select></div></div>
+    <div class="card sect" id="v-voicecard"><h3>${icon('vol', 15)}Голос ассистента</h3>
       <div class="row"><div class="grow"><div class="t">Синтез речи</div><div class="s" id="v-tstat"></div></div>
         <div class="seg" id="v-engine"><button data-e="piper" class="${local ? 'on' : ''}">Локальный (быстрый)</button><button data-e="edge" class="${local ? '' : 'on'}">Microsoft Edge (онлайн)</button></div></div>
-      <div class="grid2" style="margin-top:8px"><div class="field"><label>${local ? 'Голос (офлайн, Piper)' : 'Голос (Microsoft Edge, нужен интернет)'}</label>
-        ${local ? `<select id="v-pvoice" class="inp">${pvs.map((v) => `<option value="${esc(v.key)}" ${v.key === s.piper_voice ? 'selected' : ''}>${esc(v.label)} (${v.gender === 'ж' ? 'жен.' : 'муж.'})${v.installed ? '' : ' — скачать ~60 МБ'}</option>`).join('')}</select>`
-                : `<select id="v-voice" class="inp">${S.voices.map((v) => `<option ${v === s.voice ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`}</div>
-      <div class="field"><label>&nbsp;</label><button id="v-test" class="btn">${icon('play', 14)}Проверить голос</button></div></div>
+      <div class="grid3" style="margin-top:8px">
+        <div class="field"><label>Язык голоса</label><select id="v-vlang" class="inp">${langOpts(ANSWER_LANGS.slice(1), vl)}</select></div>
+        <div class="field"><label>${local ? 'Голос (офлайн, Piper)' : 'Голос (Microsoft Edge, нужен интернет)'}</label>
+        ${local ? `<select id="v-pvoice" class="inp"><optgroup label="Голоса Piper · ${esc(LANG_NAME[vl])}">${off.map(opt).join('')}</optgroup>${own.length ? `<optgroup label="Свои голоса">${own.map(opt).join('')}</optgroup>` : ''}</select>` : edgeSel}</div>
+        <div class="field"><label>&nbsp;</label><button id="v-test" class="btn">${icon('play', 14)}Проверить голос</button></div></div>
+      <div class="note" style="margin-top:6px">Голос подбирается по языку каждой фразы: русский ответ — русским голосом, английский — английским. Для каждого языка можно выбрать свой голос; недостающий скачается сам при первом ответе на этом языке.</div>
       <div class="row" style="margin-top:8px"><div class="grow"><div class="t">Скорость речи</div></div><input id="v-rate" class="slider" style="max-width:300px" type="range" min="-50" max="50" value="${s.tts_rate}"><span class="val" id="v-rate-v">${s.tts_rate > 0 ? '+' : ''}${s.tts_rate}%</span></div>
       <div class="row"><div class="grow"><div class="t">Громкость</div></div><input id="v-vol" class="slider" style="max-width:300px" type="range" min="0" max="100" value="${s.tts_volume}"><span class="val" id="v-vol-v">${s.tts_volume}%</span></div>
       <div class="row"><div class="grow"><div class="t">Озвучивать ответы</div><div class="s">Если выключить — ответы только текстом</div></div>${tgl('v-speak', s.speak_replies)}</div></div>
-    <div class="card sect"><h3>${icon('zap', 15)}Скорость ответа<span class="badge">новое</span></h3>
+    <div class="card sect" id="v-owncard"><h3>${icon('upload', 15)}Свои голоса</h3>
+      <div class="row"><div class="grow"><div class="t">Загрузить свой голос</div><div class="s">Голос Piper: файл <b>.onnx</b> (файл <b>.onnx.json</b> найду рядом) или <b>.zip</b> с обоими. Проверю, что он работает, и включу для его языка.</div></div>
+        <button id="v-import" class="btn">${icon('upload', 14)}Загрузить свой голос</button></div>
+      <div id="v-ownlist">${allOwn.length ? allOwn.map((v) => `<div class="row own"><div class="grow"><div class="t">${esc(v.label)}</div><div class="s">${esc(LANG_NAME[v.lang] || v.lang_full || v.lang)} · ${v.mb} МБ${voiceChoice(v.lang) === v.key ? ' · <b>используется</b>' : ''}</div></div>
+          <button class="btn sm" data-play="${esc(v.key)}" data-lang="${esc(v.lang)}">${icon('play', 13)}Прослушать</button><button class="btn sm ghost" data-del="${esc(v.key)}">${icon('trash', 13)}Удалить</button></div>`).join('')
+        : '<div class="s" style="padding:6px 2px">Пока нет своих голосов.</div>'}</div>
+      <div class="note">Где взять: <a href="#" data-link="https://huggingface.co/rhasspy/piper-voices">huggingface.co/rhasspy/piper-voices</a> (скачай оба файла голоса) · послушать примеры: <a href="#" data-link="https://rhasspy.github.io/piper-samples/">rhasspy.github.io/piper-samples</a>. Язык голоса берётся из его .onnx.json; голос звучит, когда я отвечаю на этом языке.</div></div>
+    <div class="card sect"><h3>${icon('zap', 15)}Скорость ответа</h3>
       <div class="row"><div class="grow"><div class="t">Быстрые ответы</div><div class="s">Голосом отвечает лёгкая модель${S.liteModel ? ' ' + esc(S.liteModel) : ''}: быстрее и больше бесплатный лимит. В чате остаётся основная.</div></div>${tgl('v-fast', s.fast_replies)}</div>
       <div class="row"><div class="grow"><div class="t">Распознавание речи</div><div class="s" id="v-sttstat"></div></div>
         <div class="seg" id="v-stt"><button data-m="local" class="${s.stt_mode !== 'cloud' ? 'on' : ''}">На компьютере</button><button data-m="cloud" class="${s.stt_mode === 'cloud' ? 'on' : ''}">Gemini</button></div></div>
@@ -453,15 +482,25 @@ function buildVoice() {
       ${s.wake_mode !== 'off' ? `<div class="row"><div class="grow"><div class="t">Чувствительность</div><div class="s">Меньше — реагирует охотнее (и чаще ошибается)</div></div><input id="v-thr" class="slider" style="max-width:240px" type="range" min="10" max="95" value="${Math.round(thrVal() * 100)}"><span class="val" id="v-thr-v">${thrVal().toFixed(2)}</span></div>` : ''}
       <div class="note">${s.wake_mode === 'hey_jarvis' ? 'Скажи по-английски <b>«Hey Jarvis»</b> — это фиксированная фраза, она не зависит от имени.' :
         `<b>По имени</b>: скажи «${esc(NM())}» или «Эй, ${esc(NM())}» — и сразу просьбу («${esc(NM())}, открой телеграм»), или подожди сигнал. Имя меняется во вкладке «ИИ» — я сразу начну откликаться на новое.`}
-        Слово-активатор распознаётся офлайн, звук никуда не отправляется. Для режима «по имени» и локального распознавания один раз скачивается модель Vosk (~45 МБ).</div></div>`;
+        Слово-активатор распознаётся офлайн, звук никуда не отправляется. Имя слушает русская модель Vosk (~45 МБ); просьба после имени распознаётся на твоём языке.</div></div>`;
+  $('#v-alang').onchange = async () => { const v = $('#v-alang').value; if (await save({ answer_lang: v }, true)) { S.voiceLang = v === 'auto' ? null : v; toast(`Язык ответов: ${ANSWER_LANGS.find((x) => x[0] === v)[1]}`, '', 1800); buildVoice(); } };
+  $('#v-slang').onchange = async () => { const v = $('#v-slang').value; if (await save({ speech_lang: v }, true)) { toast(`Говоришь: ${LANG_NAME[v]}`, '', 1800); buildVoice(); } };
+  $('#v-vlang').onchange = () => { S.voiceLang = $('#v-vlang').value; buildVoice(); };
   $$('#v-engine [data-e]').forEach((b) => b.onclick = async () => { if (await save({ tts_engine: b.dataset.e }, true)) { buildVoice(); toast(b.dataset.e === 'piper' ? 'Голос: локальный (быстрый)' : 'Голос: Microsoft Edge (онлайн)', '', 1600); } });
-  if ($('#v-pvoice')) $('#v-pvoice').onchange = async () => { const k = $('#v-pvoice').value; if (await save({ piper_voice: k }, true)) {
-    const v = pvs.find((x) => x.key === k); toast(v && !v.installed ? `Скачиваю голос «${v.label}» (~60 МБ, один раз)…` : `Голос: ${pvLabel(k)}`, '', 2400); buildVoice(); } };
+  if ($('#v-pvoice')) $('#v-pvoice').onchange = async () => { const k = $('#v-pvoice').value; if (await save(voicePatch(vl, k), true)) {
+    const v = pvs.find((x) => x.key === k); toast(v && !v.installed ? `Скачиваю голос «${v.label}» (~${v.mb || 60} МБ, один раз)…` : `Голос (${LANG_NAME[vl]}): ${pvLabel(k)}`, '', 2400);
+    S.tts = await API.tts_info(); buildVoice(); } };
   if ($('#v-voice')) $('#v-voice').onchange = () => save({ voice: $('#v-voice').value });
   $('#v-test').onclick = async () => {
-    const r = await API.test_voice(local ? s.voice : $('#v-voice').value, +$('#v-rate').value, +$('#v-vol').value, local ? 'piper' : 'edge', local ? $('#v-pvoice').value : '');
-    if (r && r.downloading) { if (r.tts) { S.tts = r.tts; renderTtsStatus(); } toast(`Сначала скачаю голос «${pvLabel(r.downloading)}» (~60 МБ, один раз) — потом нажми ещё раз`, '', 3200); }
+    const r = await API.test_voice(local ? s.voice : ($('#v-voice') ? $('#v-voice').value : ''), +$('#v-rate').value, +$('#v-vol').value, local ? 'piper' : 'edge', local && $('#v-pvoice') ? $('#v-pvoice').value : '', vl);
+    if (r && r.downloading) { if (r.tts) { S.tts = r.tts; renderTtsStatus(); } toast(`Сначала скачаю голос «${pvLabel(r.downloading)}» (один раз) — потом нажми ещё раз`, '', 3200); }
   };
+  $('#v-import').onclick = () => importVoice();
+  $$('#v-ownlist [data-play]').forEach((b) => b.onclick = () => API.test_voice('', +$('#v-rate').value, +$('#v-vol').value, 'piper', b.dataset.play, b.dataset.lang));
+  $$('#v-ownlist [data-del]').forEach((b) => b.onclick = async () => {
+    const k = b.dataset.del; if (!confirm(`Удалить голос «${pvLabel(k)}»?`)) return;
+    const r = await API.delete_voice(k); if (r.settings) S.settings = r.settings; if (r.tts) S.tts = r.tts; toast(r.ok ? 'Голос удалён' : 'Не получилось удалить', r.ok ? '' : 'err', 2000); buildVoice(); });
+  $$('#v-owncard [data-link]').forEach((a) => a.onclick = (e) => { e.preventDefault(); API.open_link(a.dataset.link); });
   $('#v-rate').oninput = () => { const v = +$('#v-rate').value; $('#v-rate-v').textContent = (v > 0 ? '+' : '') + v + '%'; };
   $('#v-rate').onchange = () => save({ tts_rate: +$('#v-rate').value }, true);
   $('#v-vol').oninput = () => { $('#v-vol-v').textContent = $('#v-vol').value + '%'; };
@@ -480,27 +519,58 @@ function buildVoice() {
   $('#v-speak').onclick = async () => { await save({ speak_replies: !S.settings.speak_replies }, true); buildVoice(); };
   $('#v-hk-btn').onclick = captureHotkey;
 }
+const EDGE_AUTO = { uk: 'uk-UA-OstapNeural / PolinaNeural (по полу русского голоса)', en: 'en-US-GuyNeural / JennyNeural (по полу русского голоса)',
+  de: 'de-DE-ConradNeural / KatjaNeural (по полу русского голоса)', pl: 'pl-PL-MarekNeural / ZofiaNeural (по полу русского голоса)' };
+async function importVoice(path = '', json = '') {
+  const btn = $('#v-import'); if (btn) { btn.disabled = true; btn.textContent = 'Проверяю голос…'; }
+  try {
+    let r = await API.import_voice(path, json);
+    if (r && r.need_json) {
+      toast('Не нашёл рядом файл настроек голоса (.onnx.json) — выбери его', '', 3500);
+      const j = await API.pick_voice_file('json');
+      if (!j) { buildVoice(); return; }
+      r = await API.import_voice(r.path, j);
+    }
+    if (!r || r.cancelled) { buildVoice(); return; }
+    if (r.settings) S.settings = r.settings; if (r.tts) S.tts = r.tts;
+    if (r.ok) { const v = r.voice || {}; if (r.supported) S.voiceLang = v.lang;
+      toast(r.supported ? `Голос «${v.label}» добавлен (${r.lang_label}) и включён для этого языка` : `Голос «${v.label}» добавлен, но язык ${r.lang_label} я пока не говорю`, '', 4000); }
+    else toast('Голос не подошёл: ' + (r.error || 'ошибка'), 'err', 7000);
+  } finally { buildVoice(); }
+}
 function renderTtsStatus() {
   const s = S.settings; const t = S.tts || {};
+  const vl = voiceLang();
   const el = $('#v-tstat');
   if (el) {
-    const v = (t.voices || []).find((x) => x.key === s.piper_voice) || {};
-    const dl = S.ttsDl && t.downloading ? S.ttsDl : null;
+    const key = voiceChoice(vl);
+    const v = (t.voices || []).find((x) => x.key === key) || {};
+    const dlKey = (t.downloads || []).find((k) => k === key) || t.downloading;
+    const dl = S.ttsDl && dlKey && S.ttsDl.key === dlKey ? S.ttsDl : null;
     let txt;
-    if (t.downloading) txt = `Скачиваю голос «${pvLabel(t.downloading)}»… ` + (dl && dl.total ? `${Math.round(dl.done / dl.total * 100)}% · ${mb(dl.done)} из ${mb(dl.total)} МБ` : '');
+    if (dlKey) txt = `Скачиваю голос «${pvLabel(dlKey)}»… ` + (dl && dl.total ? `${Math.round(dl.done / dl.total * 100)}% · ${mb(dl.done)} из ${mb(dl.total)} МБ` : '');
     else if (s.tts_engine === 'edge') txt = 'Через интернет: каждая фраза 1–10 с, сервис иногда не отвечает';
     else if (t.error) txt = t.error + ' — пока говорю голосом Microsoft Edge';
-    else if (!v.installed) txt = 'Голос ещё не скачан — пока говорю голосом Microsoft Edge';
-    else txt = `Офлайн, на этом компьютере: фраза за ~0,1 с${t.active === 'piper' ? '' : ' (загружаю…)'}`;
+    else if (!v.installed) txt = `Голос для языка «${LANG_NAME[vl]}» ещё не скачан — пока на этом языке говорю голосом Microsoft Edge`;
+    else txt = `Офлайн, на этом компьютере: фраза за ~0,1 с · ${LANG_NAME[vl]}: ${v.label || key}`;
     el.textContent = txt;
+  }
+  const sl = $('#v-sttlang');
+  if (sl) {
+    const x = t.stt || {}; const d = (S.sttDl && S.sttDl.lang === x.lang) ? S.sttDl : (x.lang === 'ru' ? S.wakeDl : null) || {};
+    sl.textContent = s.stt_mode === 'cloud' ? 'Распознаёт Gemini (выбрано в «Скорость ответа»)'
+      : x.error ? x.error + ' — пока распознаёт Gemini'
+      : x.model ? `Распознаю офлайн (Vosk, ${LANG_NAME[x.lang] || ''})`
+      : x.downloading ? `Скачиваю модель распознавания (${LANG_NAME[x.lang] || ''}, ~${x.mb} МБ)… ${d.total ? Math.round(d.done / d.total * 100) + '%' : ''}`
+      : `Модель для этого языка (~${x.mb || 50} МБ) скачается при первой фразе — пока распознаёт Gemini`;
   }
   const st = $('#v-sttstat');
   if (st) {
     const x = t.stt || {}; const d = S.wakeDl || {};
     st.textContent = s.stt_mode === 'cloud' ? 'Звук уходит в Gemini: точнее на шуме, но +1–2 с и ещё один запрос к лимиту'
       : x.model ? 'Vosk, офлайн: текст готов сразу, как договорил. Если не уверен в словах — спрошу Gemini'
-      : (S.wake.downloading || S.wakeDl) ? `Скачиваю модель распознавания… ${d.total ? Math.round(d.done / d.total * 100) : 0}%`
-      : 'Модель распознавания не скачана — скачаю (~45 МБ), пока распознаёт Gemini';
+      : (x.downloading || S.wakeDl) ? `Скачиваю модель распознавания… ${d.total ? Math.round(d.done / d.total * 100) : 0}%`
+      : 'Модель распознавания не скачана — скачаю, пока распознаёт Gemini';
   }
   const tm = $('#v-timing');
   if (tm) {

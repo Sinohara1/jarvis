@@ -23,19 +23,15 @@ if (-not (Test-Path -LiteralPath "jarvis.ico")) {
     & $Py -c "import sys; sys.path.insert(0, '.'); from jarvis_app.tray import make_icon_image as m; m(256).save('jarvis.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])"
 }
 
-# Piper (local TTS): bundle only the espeak-ng data needed for Russian (+ English words), ~10 MB instead of 20.
+# Piper (local TTS): bundle the full espeak-ng data (~20 MB, ~10 MB compressed) so voices of any language
+# work, including the user's own voices (v1.4).
 $PiperPkg = (& $Py -c "import piper, os; print(os.path.dirname(piper.__file__))").Trim()
 if ($LASTEXITCODE -ne 0 -or -not $PiperPkg) { throw "piper-tts is not installed in .venv (pip install -r requirements.txt)" }
 $EspeakSrc = Join-Path $PiperPkg "espeak-ng-data"
 $EspeakDst = Join-Path $ProjectDir "build_assets\piper_espeak\espeak-ng-data"
 if (Test-Path -LiteralPath $EspeakDst) { Remove-Item -LiteralPath $EspeakDst -Recurse -Force }
-New-Item -ItemType Directory -Force -Path (Join-Path $EspeakDst "lang") | Out-Null
-foreach ($f in @("phondata", "phonindex", "phontab", "intonations", "ru_dict", "en_dict")) {
-    Copy-Item -LiteralPath (Join-Path $EspeakSrc $f) -Destination $EspeakDst
-}
-foreach ($d in @("zle", "gmw")) {
-    Copy-Item -LiteralPath (Join-Path $EspeakSrc "lang\$d") -Destination (Join-Path $EspeakDst "lang") -Recurse
-}
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $EspeakDst) | Out-Null
+Copy-Item -LiteralPath $EspeakSrc -Destination $EspeakDst -Recurse
 
 & $Py -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name Jarvis `

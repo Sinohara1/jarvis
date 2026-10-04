@@ -14,6 +14,7 @@ from collections import deque
 from datetime import datetime
 
 from . import persona
+from . import lang as L
 
 # Talkativeness → model confidence threshold and multipliers for the gap / check interval.
 TALK = {
@@ -183,7 +184,7 @@ class LivePolicy:
 
 def build_prompt(settings: dict, *, task: str = "", focus_phase: str = "", title: str = "", process: str = "",
                  fullscreen: bool = False, since_remark: float | None = None, memory: list[str] | None = None,
-                 now: datetime | None = None) -> tuple[str, str]:
+                 now: datetime | None = None, user_lang: str | None = None) -> tuple[str, str]:
     """(system, user prompt) for one live-mode decision."""
     name = persona.assistant_name(settings)
     user = str(settings.get("user_name") or "").strip()
@@ -211,9 +212,10 @@ def build_prompt(settings: dict, *, task: str = "", focus_phase: str = "", title
         "даже если проблема всё ещё на экране: он мог не успеть исправить, повторять не нужно. "
         "Не комментируй очевидное и не говори ради разговора.\n"
         "confidence — насколько ты уверен, что реплика сейчас уместна и полезна (0..1).\n"
-        "text — 1–2 коротких разговорных предложения по-русски на «ты», в твоём характере, без markdown и эмодзи; "
+        "text — 1–2 коротких разговорных предложения на «ты», в твоём характере, без markdown и эмодзи; "
         "для question — заканчивай вопросом. Если speak=false, text пустой.\n"
         "activity — что он делает (3–6 слов), reason — почему говоришь или молчишь (коротко).\n"
+        f"Язык реплики (text): {L.prompt_rule(settings, user_lang, proactive=True)} activity и reason пиши по-русски.\n"
         f"Разговорчивость, которую выбрал пользователь: {talk}."
         + (f"\nПожелания пользователя: {wishes[:800]}" if wishes else "")
     )

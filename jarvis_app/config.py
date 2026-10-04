@@ -144,6 +144,10 @@ DEFAULT_SETTINGS: dict = {
     "stt_mode": "local",             # "local" (Vosk while you speak) | "cloud" (audio → Gemini)
     "fast_replies": True,            # voice turns use the lite model (typed chat keeps the chat model)
     "vad_silence_ms": 600,           # pause that ends a voice request (80 ms steps → ~0.64 s)
+    # v1.4 languages
+    "answer_lang": "ru",             # "auto" (as I asked) | ru | uk | en | de | pl — spoken and written replies
+    "speech_lang": "ru",             # the language he speaks in (local Vosk model per language)
+    "piper_voices": {},              # language → Piper voice for uk/en/de/pl (Russian: piper_voice)
     "tts_rate": 5,          # percent, -50..+50
     "tts_volume": 85,       # 0..100
     "speak_replies": True,
@@ -182,6 +186,8 @@ DEFAULT_SETTINGS: dict = {
 WAKE_MODES = ("name", "hey_jarvis", "off")
 TTS_ENGINES = ("piper", "edge")
 STT_MODES = ("local", "cloud")
+# official Piper voice key or a user's own voice («custom:<folder>» in %LOCALAPPDATA%\\Jarvis\\voices)
+VOICE_KEY_RE = r"(?:[a-z]{2,3}_[A-Z]{2}-[a-z0-9_]+-(?:x_low|low|medium|high)|custom:[a-z0-9_.-]{1,60})"
 LIVE_TALK = ("rare", "some", "often")
 
 
@@ -273,7 +279,15 @@ def normalize_settings(raw: dict) -> dict:
     if s.get("stt_mode") not in STT_MODES:
         s["stt_mode"] = "local"
     pv = str(s.get("piper_voice") or "").strip()
-    s["piper_voice"] = pv if re.fullmatch(r"[a-z]{2}_[A-Z]{2}-[a-z0-9_]+-(x_low|low|medium|high)", pv) else "ru_RU-dmitri-medium"
+    s["piper_voice"] = pv if re.fullmatch(VOICE_KEY_RE, pv) else "ru_RU-dmitri-medium"
+    langs = ("ru", "uk", "en", "de", "pl")
+    al = str(s.get("answer_lang") or "").strip().lower()
+    s["answer_lang"] = al if al in langs or al == "auto" else "ru"
+    sl = str(s.get("speech_lang") or "").strip().lower()
+    s["speech_lang"] = sl if sl in langs else "ru"
+    pvs = s.get("piper_voices")
+    s["piper_voices"] = {k: str(v) for k, v in (pvs.items() if isinstance(pvs, dict) else [])
+                         if k in langs and k != "ru" and re.fullmatch(VOICE_KEY_RE, str(v or ""))}
     s["fast_replies"] = bool(s.get("fast_replies"))
     s["vad_silence_ms"] = _clamp_int(s.get("vad_silence_ms"), 400, 2000, 600)
     return s

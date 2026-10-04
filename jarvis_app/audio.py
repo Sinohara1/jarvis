@@ -399,6 +399,7 @@ class SpeechStream:
     def __init__(self, speaker: "Speaker", gen: int, turn: VoiceTurn | None) -> None:
         self.sp, self.gen, self.turn = speaker, gen, turn
         self.closed = False
+        self.lang: str | None = None  # language of the last sentence (voice stays stable within a reply)
 
     def feed(self, text: str) -> None:
         self.sp._enqueue(self, text)
@@ -411,8 +412,11 @@ class Speaker:
     """Two-stage pipeline: synth thread (Piper or edge-tts) → player thread (sounddevice / MCI).
     The next sentence is synthesized while the current one plays. stop() interrupts everything."""
 
-    def __init__(self, get_settings, on_state=None, on_turn=None, piper=None) -> None:
+    def __init__(self, get_settings, on_state=None, on_turn=None, piper=None, lang_pref=None,
+                 on_voice_missing=None) -> None:
         self.get_settings = get_settings
+        self.lang_pref = lang_pref or (lambda: "ru")  # callable → preferred language (answer language)
+        self.on_voice_missing = on_voice_missing      # callable(piper key) — e.g. start the download
         self.on_state = on_state  # callable(bool speaking)
         self.on_turn = on_turn    # callable(VoiceTurn) when its first audio starts
         self.piper = piper
@@ -430,6 +434,7 @@ class Speaker:
         self._out_sr = 0
         self._playing = False
         self.last_engine = ""
+        self.last_voice = ""
         ensure_dir(TMP_DIR)
         threading.Thread(target=self._synth_loop, name="tts-synth", daemon=True).start()
         threading.Thread(target=self._play_loop, name="tts-play", daemon=True).start()
@@ -451,13 +456,15 @@ class Speaker:
             self._open.add(id(st))
             return st
 
-    def say(self, text: str, *, interrupt: bool = False, turn: VoiceTurn | None = None) -> None:
+    def say(self, text: str, *, interrupt: bool = False, turn: VoiceTurn | None = None,
+            lang: str | None = None) -> None:
         t = speakable(text)
         if not t:
             return
         if interrupt:
             self.stop()
         st = self.open_stream(turn)
+        st.lang = lang
         for s in split_sentences(t):
             st.feed(s)
         st.end()
@@ -503,7 +510,13 @@ class Speaker:
             self._pending += 1
         if st.turn:
             st.turn.mark("sentence")
-        self._q_text.put((st.gen, st, t))
+        from .lang import detect
+        try:
+            lg = detect(t, prefer=st.lang or self.lang_pref())
+        except Exception:
+            lg = "ru"
+        st.lang = lg
+        self._q_text.put((st.gen, st, t, lg))
 
     def _end_stream(self, st: SpeechStream) -> None:
         with self._lock:
@@ -536,28 +549,41 @@ class Speaker:
             except Exception:
                 pass
 
-    def engine_for(self, s: dict) -> str:
+    def piper_key(self, s: dict, lang: str | None = None) -> str:
+        from .tts_local import voice_for_lang
+        return voice_for_lang(s, lang or self.lang_pref() or "ru")
+
+    def engine_for(self, s: dict, lang: str | None = None) -> str:
         if s.get("tts_engine", "piper") == "piper" and self.piper is not None \
-                and self.piper.ready(s.get("piper_voice") or ""):
+                and self.piper.ready(self.piper_key(s, lang)):
             return "piper"
         return "edge"
 
-    def synth_clip(self, text: str, s: dict) -> _Clip:
-        """Synthesize one sentence with the configured engine; falls back to the other one."""
-        eng = self.engine_for(s)
-        order = [eng] + (["edge"] if eng == "piper" else (["piper"] if self.piper is not None
-                                                            and self.piper.ready(s.get("piper_voice") or "") else []))
+    def synth_clip(self, text: str, s: dict, lang: str | None = None) -> _Clip:
+        """Synthesize one sentence in the voice of its language; Piper ↔ edge-tts fall back to each other."""
+        from .lang import edge_voice
+        lang = lang or self.lang_pref() or "ru"
+        key = self.piper_key(s, lang)
+        piper_ok = self.piper is not None and self.piper.ready(key)
+        if s.get("tts_engine", "piper") == "piper" and not piper_ok and key and self.on_voice_missing:
+            try:
+                self.on_voice_missing(key)  # this sentence goes through Edge, the next ones offline
+            except Exception:
+                pass
+        eng = "piper" if (s.get("tts_engine", "piper") == "piper" and piper_ok) else "edge"
+        order = [eng] + (["edge"] if eng == "piper" else (["piper"] if piper_ok else []))
         last: Exception | None = None
         for e in order:
             try:
                 if e == "piper":
-                    pcm, sr = self.piper.synth(text, s.get("piper_voice"), int(s.get("tts_rate", 0)))
-                    self.last_engine = "piper"
+                    pcm, sr = self.piper.synth(text, key, int(s.get("tts_rate", 0)))
+                    self.last_engine, self.last_voice = "piper", key
                     return _Clip(text, pcm=pcm, sr=sr)
                 fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3", dir=TMP_DIR)
                 os.close(fd)
                 try:
-                    synth_to_file(text, s.get("voice", "ru-RU-DmitryNeural"), int(s.get("tts_rate", 0)), path)
+                    synth_to_file(text, edge_voice(s, lang), int(s.get("tts_rate", 0)), path)
+                    self.last_voice = edge_voice(s, lang)
                 except Exception:
                     _rm(path)
                     raise
@@ -573,7 +599,7 @@ class Speaker:
             item = self._q_text.get()
             if item is None:
                 return
-            gen, st, text = item
+            gen, st, text, lang = item
             # stay at most ~2 sentences ahead of playback (no wasted CPU on a reply that gets interrupted)
             while self._q_audio.qsize() >= 2 and gen == self._gen:
                 time.sleep(0.02)
@@ -581,7 +607,7 @@ class Speaker:
                 continue
             try:
                 t0 = time.monotonic()
-                clip = self.synth_clip(text, self.get_settings())
+                clip = self.synth_clip(text, self.get_settings(), lang)
                 if st.turn:
                     st.turn.mark("synth")
                 log.debug("tts %s %.2fs: %s", self.last_engine, time.monotonic() - t0, text[:60])

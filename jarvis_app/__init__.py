@@ -2,4 +2,4 @@
 
 APP_NAME = "Jarvis"
 APP_TITLE = "Джарвис"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"

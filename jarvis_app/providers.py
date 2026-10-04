@@ -195,7 +195,7 @@ class Provider:
                  temperature: float = 0.2, max_tokens: int = 1024) -> str:
         raise NotImplementedError
 
-    def transcribe(self, model: str, wav: bytes, *, timeout: float = 40.0) -> str:
+    def transcribe(self, model: str, wav: bytes, *, timeout: float = 40.0, lang: str = "ru") -> str:
         raise ProviderError("Распознавание речи не поддерживается этим провайдером")
 
 
@@ -330,9 +330,11 @@ class GeminiProvider(Provider):
                      timeout=timeout, provider="gemini")
         return self._parse(data, model).text
 
-    def transcribe(self, model, wav, *, timeout=40.0):
+    def transcribe(self, model, wav, *, timeout=40.0, lang="ru"):
+        from .lang import LANGS
+        usual = LANGS.get(lang, LANGS["ru"])["name_gen"]
         prompt = (
-            "Дословно расшифруй речь в этом аудио на языке оригинала (обычно русский). "
+            f"Дословно расшифруй речь в этом аудио на языке оригинала (обычно {usual}). "
             "Выведи только текст, без кавычек и пояснений. "
             "Если речи нет или она неразборчива, выведи ровно: <пусто>"
         )
@@ -523,7 +525,7 @@ class OpenAICompatProvider(Provider):
         data = self._complete(payload, timeout)
         return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
 
-    def transcribe(self, model, wav, *, timeout=40.0):
+    def transcribe(self, model, wav, *, timeout=40.0, lang="ru"):
         if self.name != "openai":
             raise ProviderError("Распознавание речи не поддерживается этим провайдером")
         try:
@@ -531,7 +533,7 @@ class OpenAICompatProvider(Provider):
                 f"{self.base_url}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 files={"file": ("speech.wav", wav, "audio/wav")},
-                data={"model": "whisper-1", "language": "ru"},
+                data={"model": "whisper-1", "language": lang if lang in ("ru", "uk", "en", "de", "pl") else "ru"},
                 timeout=timeout,
             )
         except requests.RequestException as e:

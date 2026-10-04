@@ -15,10 +15,11 @@ from . import providers as P
 from .actions import Actions
 from .audio import MicHub, Recording, SentenceSplitter, Speaker, VoiceTurn, beep
 from .brain import Brain, TurnCancelled, context_line
+from . import lang as L
 from . import stt_local, tts_local
 from . import persona
 from .config import load_settings, normalize_settings, register_secrets, save_settings
-from .focus import FocusSession, Stats, fmt_clock, minutes_phrase
+from .focus import FocusSession, Stats, fmt_clock
 from .hotkey import Hotkey
 from .live import LivePolicy, build_prompt, live_intent, talk_params
 from .watcher import (Foreground, NudgePolicy, capture_screen_jpeg, get_foreground, is_call,
@@ -49,12 +50,16 @@ class JarvisCore:
         self.session = FocusSession()
         self.mic = MicHub()
         self.piper = tts_local.PiperTTS()
+        self.user_lang: str | None = None  # language of his last message (for «Как я спросил»)
         self.speaker = Speaker(lambda: self.settings, on_state=self._on_speaking, on_turn=self._on_turn,
-                               piper=self.piper)
+                               piper=self.piper, lang_pref=self._reply_lang, on_voice_missing=self._voice_missing)
         self._turn: VoiceTurn | None = None
         self._answering = False
-        self._piper_dl: str | None = None
+        self._piper_dl: list[str] = []
         self._piper_err: str | None = None
+        self._piper_failed: set[str] = set()
+        self._stt_dl: str | None = None
+        self._stt_err: str | None = None
         self.last_timing: dict | None = None
         self.actions = Actions(self)
         self.brain = Brain(lambda: self.settings, self.actions, self._context)
@@ -104,22 +109,28 @@ class JarvisCore:
         log.info("core started; provider=%s chat=%s lite=%s", self.settings["provider"],
                  *self.brain.models())
 
-    # ── fast voice (v1.3): local TTS + local STT preparation ──
+    # ── fast voice (v1.3) + languages (v1.4): local TTS + local STT preparation ──
+    def _reply_lang(self) -> str:
+        return L.reply_lang(self.settings, self.user_lang)
+
     def _prepare_voice(self) -> None:
         """Warm up what the next voice turn needs, so the first answer is not slower than the rest."""
         s = self.settings
         if s["tts_engine"] == "piper":
-            self.ensure_piper_voice(s["piper_voice"])
+            self.ensure_piper_voice(tts_local.voice_for_lang(s, self._reply_lang()))
         if s["stt_mode"] == "local":
             self._ensure_stt_model()
 
     def ensure_piper_voice(self, key: str) -> None:
+        if not key:
+            return
         if not tts_local.available():
             self._piper_err = "движок Piper не найден в сборке"
             return
         if tts_local.installed(key):
             try:
                 self.piper.load(key)
+                self._piper_err = None
             except Exception as e:
                 self._piper_err = f"не удалось загрузить голос: {e}"
                 log.exception("piper load failed")
@@ -127,57 +138,133 @@ class JarvisCore:
             return
         self.download_voice(key)
 
+    def _voice_missing(self, key: str) -> None:
+        """Speaker needed a voice that is not on disk (reply in a new language): fetch it once."""
+        if key in tts_local.PIPER_VOICES and key not in self._piper_dl and key not in self._piper_failed:
+            log.info("voice %s needed for %s — downloading", key, tts_local.voice_lang(key))
+            self.download_voice(key)
+
     def download_voice(self, key: str) -> bool:
         if key not in tts_local.PIPER_VOICES:
             return False
-        if self._piper_dl:
-            return self._piper_dl == key
-        self._piper_dl, self._piper_err = key, None
+        if key in self._piper_dl:
+            return True
+        if any(tts_local.file_key(k) == tts_local.file_key(key) for k in self._piper_dl):
+            return True  # same file (multi-speaker voice) is already on its way
+        self._piper_dl.append(key)
+        self._piper_err = None
         self._emit_tts()
 
         def work() -> None:
             try:
                 log.info("downloading piper voice %s", key)
                 tts_local.download_voice(key, lambda d, t: self.emit("tts_dl", key=key, done=d, total=t))
-                self._piper_dl = None
-                if self.settings["piper_voice"] == key and self.settings["tts_engine"] == "piper":
+                self._piper_failed.discard(key)
+                s = self.settings
+                if s["tts_engine"] == "piper" and key == tts_local.voice_for_lang(s, self._reply_lang()):
                     self.piper.load(key)
             except Exception as e:
-                self._piper_dl = None
+                self._piper_failed.add(key)
                 self._piper_err = f"не удалось скачать голос: {e}"
                 log.error("piper voice download failed: %s", e)
+            finally:
+                if key in self._piper_dl:
+                    self._piper_dl.remove(key)
             self._emit_tts()
         threading.Thread(target=work, name="piper-download", daemon=True).start()
         return True
 
+    def import_voice(self, path: str, json_path: str | None = None) -> dict:
+        """«Загрузить свой голос»: validate + copy, then use it for its language."""
+        try:
+            meta = tts_local.import_voice(path, json_path)
+        except tts_local.NeedJson as e:
+            return {"ok": False, "need_json": True, "error": str(e)}
+        except Exception as e:
+            log.warning("custom voice import failed: %s", e)
+            return {"ok": False, "error": str(e)}
+        code = meta.get("lang")
+        new = dict(self.settings)
+        if code == "ru":
+            new["piper_voice"] = meta["key"]
+        elif code in L.LANGS:
+            new["piper_voices"] = dict(new.get("piper_voices") or {}, **{code: meta["key"]})
+        if code in L.LANGS:
+            self.apply_settings(new)
+        self._emit_tts()
+        return {"ok": True, "voice": meta, "supported": code in L.LANGS,
+                "lang_label": L.LANGS[code]["label"] if code in L.LANGS else meta.get("lang_full", code)}
+
+    def delete_voice(self, key: str) -> dict:
+        if not tts_local.is_custom(key):
+            return {"ok": False, "error": "удалять можно только свои голоса"}
+        mpath = tts_local.voice_files(key)[0]
+        with self.piper._lock:
+            self.piper._voices.pop(mpath, None)  # release the file (Windows keeps it locked otherwise)
+        ok = tts_local.delete_custom(key)
+        new = dict(self.settings)
+        if new.get("piper_voice") == key:
+            new["piper_voice"] = tts_local.DEFAULT_VOICE
+        new["piper_voices"] = {k: v for k, v in (new.get("piper_voices") or {}).items() if v != key}
+        self.apply_settings(new)
+        self._emit_tts()
+        return {"ok": ok}
+
     def tts_info(self) -> dict:
         s = self.settings
+        rl = self._reply_lang()
         return {"engine": s["tts_engine"], "voice": s["piper_voice"], "voices": tts_local.voices_payload(),
-                "downloading": self._piper_dl, "error": self._piper_err, "available": tts_local.available(),
-                "active": self.speaker.engine_for(s), "stt": self.stt_info(), "timing": self.last_timing}
+                "voice_for": {c: tts_local.voice_for_lang(s, c) for c in L.CODES}, "reply_lang": rl,
+                "downloading": self._piper_dl[0] if self._piper_dl else None, "downloads": list(self._piper_dl),
+                "error": self._piper_err, "available": tts_local.available(),
+                "active": self.speaker.engine_for(s, rl), "stt": self.stt_info(), "timing": self.last_timing,
+                "langs": L.payload(), "links": list(tts_local.LINKS)}
 
     def _emit_tts(self) -> None:
         self.emit("tts", **self.tts_info())
 
     def stt_info(self) -> dict:
-        from . import namewake
-        return {"mode": self.settings["stt_mode"], "model": bool(namewake.find_model()),
-                "loaded": stt_local.is_loaded(), "downloading": self._wake_dl}
+        code = L.speech_lang(self.settings)
+        return {"mode": self.settings["stt_mode"], "lang": code, "model": bool(stt_local.model_path(code)),
+                "loaded": stt_local.is_loaded(code),
+                "downloading": self._wake_dl if code == "ru" else self._stt_dl == code,
+                "error": self._stt_err, "mb": round(L.LANGS[code]["vosk"][1] / 1e6)}
 
     def _ensure_stt_model(self) -> None:
-        path = stt_local.model_path()
+        code = L.speech_lang(self.settings)
+        path = stt_local.model_path(code)
         if path:
             try:
                 t0 = time.monotonic()
                 stt_local.get_model(path)
-                log.info("local stt model ready in %.2fs", time.monotonic() - t0)
+                log.info("local stt model (%s) ready in %.2fs", code, time.monotonic() - t0)
             except Exception as e:
                 log.error("local stt model load failed: %s", e)
             return
-        if not self._wake_dl:
-            self._wake_dl = True
-            threading.Thread(target=self._download_vosk, name="vosk-download", daemon=True).start()
-            self._emit_wake()
+        if code == "ru":
+            if not self._wake_dl:
+                self._wake_dl = True
+                threading.Thread(target=self._download_vosk, name="vosk-download", daemon=True).start()
+                self._emit_wake()
+            return
+        if self._stt_dl == code:
+            return
+        self._stt_dl, self._stt_err = code, None
+        self._emit_tts()
+
+        def work() -> None:
+            try:
+                log.info("downloading vosk model for %s", code)
+                stt_local.download(code, lambda d, t: self.emit("stt_dl", lang=code, done=d, total=t))
+                self._stt_dl = None
+                if L.speech_lang(self.settings) == code and self.settings["stt_mode"] == "local":
+                    self._ensure_stt_model()
+            except Exception as e:
+                self._stt_dl = None
+                self._stt_err = f"не удалось скачать модель распознавания: {e}"
+                log.error("vosk %s download failed: %s", code, e)
+            self._emit_tts()
+        threading.Thread(target=work, name=f"vosk-download-{code}", daemon=True).start()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -221,9 +308,14 @@ class JarvisCore:
         if old["provider"] != self.settings["provider"]:
             self.brain.reset()
         s = self.settings
-        if s["tts_engine"] == "piper" and (old["piper_voice"] != s["piper_voice"] or old["tts_engine"] != "piper"):
-            threading.Thread(target=self.ensure_piper_voice, args=(s["piper_voice"],), daemon=True).start()
-        if s["stt_mode"] == "local" and old["stt_mode"] != "local":
+        if old["answer_lang"] != s["answer_lang"]:
+            self.user_lang = None
+        voice_now = tts_local.voice_for_lang(s, self._reply_lang())
+        if s["tts_engine"] == "piper" and (voice_now != tts_local.voice_for_lang(old, L.reply_lang(old, self.user_lang))
+                                           or old["tts_engine"] != "piper" or old["piper_voice"] != s["piper_voice"]
+                                           or old.get("piper_voices") != s.get("piper_voices")):
+            threading.Thread(target=self.ensure_piper_voice, args=(voice_now,), daemon=True).start()
+        if s["stt_mode"] == "local" and (old["stt_mode"] != "local" or old["speech_lang"] != s["speech_lang"]):
             threading.Thread(target=self._ensure_stt_model, daemon=True).start()
         if old["vad_silence_ms"] != s["vad_silence_ms"] and self.wake is not None and hasattr(self.wake, "set_hang"):
             self.wake.set_hang(s["vad_silence_ms"] / 1000.0)
@@ -394,9 +486,23 @@ class JarvisCore:
             turn.mark("speech_end", det.get("t_speech_end"))
             turn.mark("rec_end")
             text = det.get("request_text") or ""
-            if self.settings["stt_mode"] == "local" and stt_local.acceptable(text, det.get("request_conf", 0.0)):
+            code = L.speech_lang(self.settings)
+            local = self.settings["stt_mode"] == "local"
+            if local and code == "ru" and stt_local.acceptable(text, det.get("request_conf", 0.0)):
                 turn.stt = "wake-local"
                 turn.mark("text")
+            elif local and code != "ru" and request_wav and stt_local.is_loaded(code):
+                # the name is spotted by the Russian model; the request itself is in his language
+                try:
+                    text, conf = stt_local.transcribe_wav(stt_local.get_model(stt_local.model_path(code)), request_wav)
+                except Exception as e:
+                    log.warning("wake request local stt (%s) failed: %s", code, e)
+                    text, conf = "", 0.0
+                if stt_local.acceptable(text, conf):
+                    turn.stt = "wake-local"
+                    turn.mark("text")
+                else:
+                    text = ""
             else:
                 text = ""
             self.set_state("thinking", "Думаю…" if text else "Распознаю…")
@@ -411,13 +517,14 @@ class JarvisCore:
             kw = {"no_speech_timeout": float(no_speech_timeout)} if no_speech_timeout else {}
             stt = None
             if self.settings["stt_mode"] == "local":
-                path = stt_local.model_path()
-                if path and stt_local.is_loaded():
+                code = L.speech_lang(self.settings)
+                path = stt_local.model_path(code)
+                if path and stt_local.is_loaded(code):
                     try:
                         stt = stt_local.StreamingSTT(stt_local.get_model(path))
                     except Exception as e:
                         log.warning("local stt unavailable: %s", e)
-                elif path:  # loads in ~0.7 s; this turn goes to the cloud, the next one is local
+                else:  # loads in ~0.5 s (or downloads once); this turn goes to the cloud, the next one is local
                     threading.Thread(target=self._ensure_stt_model, daemon=True).start()
             rec = Recording(self.mic, auto_stop=(mode in ("auto", "reply")),
                             on_level=lambda lv: self.emit("level", level=lv), stt=stt,
@@ -466,8 +573,8 @@ class JarvisCore:
             self._interrupt()
             self._jobs.put(("text", t))
 
-    def say(self, text: str, *, interrupt: bool = False) -> None:
-        self.speaker.say(text, interrupt=interrupt)
+    def say(self, text: str, *, interrupt: bool = False, lang: str | None = None) -> None:
+        self.speaker.say(text, interrupt=interrupt, lang=lang)
 
     # ── worker ──
     def _worker(self) -> None:
@@ -479,14 +586,18 @@ class JarvisCore:
             try:
                 if kind == "voice":
                     turn, wav, text = payload
+                    code = L.speech_lang(self.settings)
                     if not text:
                         self.set_state("thinking", "Распознаю…")
                         turn.stt = "cloud"
-                        text = self.brain.transcribe(wav)
+                        text = self.brain.transcribe(wav, lang=code)
                         turn.mark("text")
                         if not text:
                             self.set_state("idle", "Не расслышал")
                             continue
+                        self.user_lang = L.detect(text, prefer=code)
+                    else:
+                        self.user_lang = code  # the local model only knows its own language
                     self.emit("chat", role="user", text=text)
                     self._answer(text, voice=True, turn=turn)
                 elif kind == "audio":  # legacy path (kept for tests/tools)
@@ -498,6 +609,7 @@ class JarvisCore:
                     self.emit("chat", role="user", text=text)
                     self._answer(text, voice=True)
                 elif kind == "text":
+                    self.user_lang = L.detect(payload, prefer=self.user_lang or L.speech_lang(self.settings))
                     self.emit("chat", role="user", text=payload)
                     self._answer(payload)
             except TurnCancelled:
@@ -524,8 +636,10 @@ class JarvisCore:
         self._answering = True
         tools_used: list[str] = []
         speak = bool(self.settings["speak_replies"])
+        turn_lang = self._reply_lang()
         stream = self.speaker.open_stream(turn) if speak else None
         if stream is not None:
+            stream.lang = turn_lang
             self.speaker.prewarm()
         splitter = SentenceSplitter()
         parts: list[str] = []
@@ -579,14 +693,15 @@ class JarvisCore:
                 with lock:
                     for snt in splitter.flush():  # say «Открываю…» before the tool runs
                         speak_sentence(snt)
-                    if voice and spoken[0] == 0 and n in TOOL_ACK:
-                        acked.append(TOOL_ACK[n])
-                        speak_sentence(TOOL_ACK[n])
+                    a = L.ack(n, turn_lang)
+                    if voice and spoken[0] == 0 and a:
+                        acked.append(a)
+                        speak_sentence(a)
 
         if stream is not None:
             threading.Thread(target=idle_flush, name="tts-idle-flush", daemon=True).start()
         try:
-            reply = self.brain.ask(text, on_tool=on_tool, on_text=on_text,
+            reply = self.brain.ask(text, on_tool=on_tool, on_text=on_text, lang=turn_lang,
                                    fast=voice and bool(self.settings["fast_replies"]), voice=voice)
             turn.model = turn.model or self.brain.last_model
             finished.set()
@@ -674,18 +789,19 @@ class JarvisCore:
         self.stats.add_focus(ev.focus_seconds)
         beep("phase")
         task = self.session.task
+        code = self._reply_lang()
         if ev.new == "break":
-            text = f"Блок закончен, отличная работа! Перерыв {minutes_phrase(self.session.break_sec // 60)}. Встань и разомнись."
+            text = L.text("break", code, mins=L.minutes(self.session.break_sec // 60, code))
         elif ev.new == "focus":
-            text = f"Перерыв окончен. Возвращаемся к задаче: {task}."
+            text = L.text("back", code, task=task)
         else:
-            text = f"Готово! Фокус-сессия «{task}» завершена. Сегодня в фокусе уже {self.stats.today() // 60} минут."
+            text = L.text("done", code, task=task, today=L.minutes(self.stats.today() // 60, code))
             self.guard_status = "Страж ждёт фокус-сессию"
         self.policy.reset()
         self.emit("chat", role="jarvis", text=text)
         self.emit("notify", text=text)
         self.emit("focus")
-        self.say(text)
+        self.say(text, lang=code)
 
     # ── reminders ──
     def add_reminder(self, text: str, due: datetime) -> dict:
@@ -716,13 +832,14 @@ class JarvisCore:
                 if r["due"] <= now:
                     due.append(r)
                     self.reminders.remove(r)
+        code = self._reply_lang()
         for r in due:
-            text = f"Напоминаю: {r['text']}."
+            text = L.text("remind", code, text=str(r["text"]).rstrip(". "))
             beep("phase")
             self.emit("chat", role="jarvis", text=text)
             self.emit("notify", text=text)
             self.emit("reminders")
-            self.say(text)
+            self.say(text, lang=code)
 
     # ── screen ──
     def look_at_screen(self, question: str) -> dict:
@@ -819,15 +936,20 @@ class JarvisCore:
             self._episode_counted = True
         if self.state in ("listening", "thinking"):
             return
-        left = minutes_phrase(max(1, int(self.session.remaining() // 60)))
-        text = persona.nudge_text(self.settings, level, self.session.task, left=left)
+        code = self._reply_lang()
+        left = L.minutes(max(1, int(self.session.remaining() // 60)), code)
+        text = None
+        if code != "ru":
+            text = L.nudge(code, level, self.session.task, left, str(self.settings.get("user_name") or "").strip())
+        if not text:
+            text = persona.nudge_text(self.settings, level, self.session.task, left=left)
         log.info("nudge level %d", level)
         self.live.on_remark(now, "guard")
         beep("nudge")
         self.emit("chat", role="jarvis", text=text, kind="nudge")
         self.emit("notify", text=text)
         self.emit("focus")
-        self.say(text)
+        self.say(text, lang=code)
 
     # ── live mode (v1.2) ──
     def set_live(self, on: bool) -> dict:
@@ -904,7 +1026,7 @@ class JarvisCore:
             since = None if self.live.last_remark is None else now - self.live.last_remark
             system, prompt = build_prompt(s, task=snap["task"], focus_phase=snap["phase"], title=fg.title,
                                           process=fg.process, fullscreen=fullscreen, since_remark=since,
-                                          memory=self.live.memory_lines(now))
+                                          memory=self.live.memory_lines(now), user_lang=self.user_lang)
             d = self.brain.live_decide(jpeg, system, prompt)
             del jpeg  # memory only, never saved
             self.live.on_success()
@@ -954,7 +1076,7 @@ class JarvisCore:
         if not self.settings["speak_replies"]:
             return
         beep("phase" if kind != "nudge" else "nudge")
-        self.say(text)
+        self.say(text, lang=self._reply_lang())
         reply = self.settings["live_reply_sec"]
         if kind == "question" and reply > 0:
             threading.Thread(target=self._await_reply, args=(reply,), name="live-reply", daemon=True).start()

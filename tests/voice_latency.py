@@ -26,6 +26,9 @@ ap.add_argument("--silence-ms", type=int, default=0)
 ap.add_argument("--noise", type=float, default=40.0)
 ap.add_argument("--pause", type=float, default=4.0, help="seconds between questions (free-tier RPM)")
 ap.add_argument("--log", default="", help="write the app log here (INFO)")
+ap.add_argument("--speech-lang", default="", help="ru|uk|en|de|pl — the language of the WAVs")
+ap.add_argument("--answer-lang", default="", help="auto|ru|uk|en|de|pl")
+ap.add_argument("--import-voice", default="", help="import this Piper .onnx/.zip as a custom voice first (deleted after)")
 a = ap.parse_args()
 if a.log:
     from jarvis_app.config import setup_logging
@@ -95,6 +98,8 @@ if a.stt: s["stt_mode"] = a.stt
 if a.engine: s["tts_engine"] = a.engine
 if a.fast: s["fast_replies"] = a.fast == "1"
 if a.silence_ms: s["vad_silence_ms"] = a.silence_ms
+if a.speech_lang: s["speech_lang"] = a.speech_lang
+if a.answer_lang: s["answer_lang"] = a.answer_lang
 s["speak_replies"] = True
 core.settings = config.normalize_settings(s)  # not saved to disk
 hub = FakeHub()
@@ -107,10 +112,23 @@ t0 = time.monotonic()
 core._prepare_voice()
 print(f"prepare: {time.monotonic() - t0:.1f}s; engine={core.speaker.engine_for(core.settings)} stt={core.settings['stt_mode']} "
       f"fast={core.settings['fast_replies']} silence={core.settings['vad_silence_ms']}ms", flush=True)
-for _ in range(200):  # wait for the piper voice download / load
-    if core.settings["tts_engine"] != "piper" or core.speaker.engine_for(core.settings) == "piper" or core._piper_err:
+from jarvis_app import lang as L, stt_local
+imported = None
+if a.import_voice:
+    import jarvis_app.core as _core_mod
+    _core_mod.save_settings = lambda *_a, **_k: None  # test settings must not land in settings.json
+    res = core.import_voice(a.import_voice)
+    imported = (res.get("voice") or {}).get("key")
+    print("import:", {k: res[k] for k in ("ok", "lang_label") if k in res}, imported, res.get("error", ""), flush=True)
+for _ in range(200):  # wait for the piper voice / vosk model download + load
+    voice_ok = (core.settings["tts_engine"] != "piper" or core.speaker.engine_for(core.settings, core._reply_lang()) == "piper"
+                or core._piper_err)
+    stt_ok = core.settings["stt_mode"] != "local" or stt_local.is_loaded(L.speech_lang(core.settings)) or core._stt_err
+    if voice_ok and stt_ok:
         break
     time.sleep(1)
+print(f"ready: voice={core.speaker.piper_key(core.settings, core._reply_lang())} "
+      f"stt={stt_local.model_path(L.speech_lang(core.settings))}", flush=True)
 
 texts = open(os.path.join(a.wavs, "text.txt"), encoding="utf-8").read().splitlines()
 rows = []
@@ -126,6 +144,8 @@ for i in [int(x) for x in a.ids.split(",")][:a.n]:
     # first_audio from the core is measured from the VAD's last voiced chunk; also report vs the true end of speech
     at = timing.pop("_at", None)
     r = dict(q=texts[i], heard=heard, reply=reply[:90], error=err, ok=ok, **timing)
+    r["reply_lang"] = L.detect(reply) if reply else None
+    r["voice"] = core.speaker.last_voice
     # the core measures from the VAD's last voiced chunk; this is from the true end of the WAV's speech
     r["true_first_audio"] = round(at - hub.speech_end_t, 3) if at and hub.speech_end_t else None
     rows.append(r)
@@ -133,6 +153,8 @@ for i in [int(x) for x in a.ids.split(",")][:a.n]:
     time.sleep(a.pause)
 
 keys = ["endpoint", "stt", "llm_first", "first_sentence", "tts", "play", "first_audio", "true_first_audio"]
+if imported:
+    print("delete:", core.delete_voice(imported), flush=True)
 good = [r for r in rows if r.get("first_audio") is not None]
 if good:
     print("MEAN", json.dumps({k: round(sum(r[k] or 0 for r in good) / len(good), 3) for k in keys}), f"({len(good)}/{len(rows)} ok)")
