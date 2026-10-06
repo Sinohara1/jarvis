@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Джарвис</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; color: #e8f4ff;
+    font-family: "Segoe UI", sans-serif; user-select: none; overflow: hidden; }
+  .box { height: 100%; box-sizing: border-box; padding: 10px 14px;
+    background: rgba(8, 16, 32, .82); border: 1px solid rgba(120, 190, 255, .35);
+    border-radius: 14px; display: flex; flex-direction: column; gap: 4px;
+    box-shadow: 0 10px 28px rgba(0,0,0,.35); }
+  .row { display: flex; align-items: center; gap: 8px; -webkit-app-region: drag; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #7eb6ff; box-shadow: 0 0 8px #7eb6ff; }
+  .dot.speaking { background: #7dffe1; box-shadow: 0 0 8px #7dffe1; }
+  .dot.listening { background: #ffd27a; box-shadow: 0 0 8px #ffd27a; }
+  .st { font-size: 12px; letter-spacing: .04em; color: #9fd0ff; text-transform: uppercase; }
+  .tx { font-size: 14px; line-height: 1.35; color: #f4fbff; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="row"><span class="dot" id="dot"></span><span class="st" id="st">Джарвис</span></div>
+    <div class="tx" id="tx">Оверлей поверх игры. Ответ появится здесь.</div>
+  </div>
+  <script>
+    const dot = document.getElementById('dot'), st = document.getElementById('st'), tx = document.getElementById('tx');
+    const labels = {idle:'ожидание', listening:'слушаю', thinking:'думаю', speaking:'говорю'};
+    window.overlaySet = function (s) {
+      s = s || {};
+      dot.className = 'dot ' + (s.state || '');
+      st.textContent = labels[s.state] || s.state || 'Джарвис';
+      if (s.text) tx.textContent = s.text;
+    };
+  </script>
+</body>
+</html>
