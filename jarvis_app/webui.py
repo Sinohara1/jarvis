@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import logging
 import os
 import queue
@@ -14,7 +15,7 @@ import time
 from datetime import datetime
 
 from . import APP_TITLE, APP_VERSION, persona, updater
-from .actions import TOOLS
+from .actions import TOOLS, tools_for_settings
 from .config import (DATA_DIR, PROVIDERS, VOICES, api_key_for, bundle_dir, ensure_dir, normalize_settings)
 from .core import JarvisCore
 from .focus import format_days, format_duration, phase_label
@@ -36,6 +37,10 @@ TOOL_RU = {
     "set_reminder": "ставлю напоминание", "list_reminders": "смотрю напоминания",
     "cancel_reminders": "отменяю напоминания", "get_time": "смотрю время", "look_at_screen": "смотрю на экран",
     "set_live_mode": "живой режим",
+    "media_control": "управление медиа", "adjust_volume": "громкость",
+    "send_telegram": "пишу в Telegram", "run_elevated": "запуск от администратора",
+    "telegram_open_chat": "открываю чат в Telegram", "app_search": "ищу в приложении",
+    "remember_fact": "запоминаю", "forget_fact": "забываю", "recall_memory": "вспоминаю",
 }
 
 ABILITIES = [
@@ -43,11 +48,16 @@ ABILITIES = [
     ("globe", "Открыть сайт", "Любая http/https-ссылка в браузере", "Открой ютуб"),
     ("search", "Поиск в интернете", "Google, YouTube и другие", "Найди в интернете рецепт блинов"),
     ("file", "Найти файл", "Ищет по имени в Рабочем столе, Документах, Загрузках…", "Найди файл реферат"),
+    ("play", "Музыка и медиа", "Найдёт и включит трек в Spotify, медиаклавиши Play·Pause·Next (уровень «стандарт»+)", "Включи Can't Fault Das в спотике"),
     ("target", "Фокус-сессия", "Таймер + страж от TikTok и шортсов", "Я делаю домашку по физике 40 минут"),
     ("bell", "Напоминания и таймеры", "Через N минут или в ЧЧ:ММ", "Напомни через 15 минут выпить воды"),
     ("monitor", "Посмотреть на экран", "Скриншот активного монитора → ответ", "Что у меня на экране?"),
     ("eye", "Живой режим", "Сам поглядывает на экран и подсказывает, когда уместно", "Следи и подсказывай"),
+    ("chat", "Сообщение в Telegram", "Desktop, от твоего имени (уровень «полный», best-effort)", "Напиши в телеграм Маме: я дома"),
+    ("chat", "Чат или Избранное в Telegram", "Открывает нужный чат или Saved Messages (уровень «полный»)", "Открой избранное в телеграме"),
+    ("search", "Поиск внутри приложений", "Discord, VS Code, браузер, Проводник, Steam… (уровень «полный»)", "Найди в дискорде канал общий"),
     ("clock", "Время и дата", "", "Сколько сейчас времени?"),
+    ("user", "Память", "Помнит факты о тебе, людях и проектах — настраивается в «ИИ → Память»", "Запомни, что я люблю кофе без сахара"),
 ]
 
 DAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -235,21 +245,25 @@ class Bridge:
     def init(self) -> dict:
         c = self._core
         s = c.settings
-        prov = s["provider"]
         data = {
             "version": APP_VERSION, "settings": self._settings_payload(),
             "providers": {k: {"label": v["label"], "chat_models": v["chat_models"], "lite_models": v["lite_models"],
-                              "key_url": v["key_url"], "base_url": v["base_url"]} for k, v in PROVIDERS.items()},
+                              "key_url": v["key_url"], "base_url": v["base_url"], "local": bool(v.get("local")),
+                              "openai_compat": bool(v.get("openai_compat")),
+                              "editable_base": bool(v.get("editable_base"))}
+                          for k, v in PROVIDERS.items()},
             "voices": VOICES, "abilities": [dict(zip(("icon", "title", "desc", "example"), a)) for a in ABILITIES],
             "tools": [{"name": t["name"], "label": TOOL_RU.get(t["name"], t["name"]), "desc": t["description"]}
-                      for t in TOOLS],
+                      for t in tools_for_settings(s)],
             "chat": self._chat.snapshot(), "focus": self._focus_payload(), "stats": self._stats_payload(),
             "state": c.state, "hotkey": hotkey_pretty(s["hotkey"]), "autostart": get_autostart() or s["autostart"],
             "wake": c.wake_info(), "maximized": self._frame.maximized,
             "live": {"enabled": bool(s["live_mode"]), "status": c.live_status},
-            "has_key": bool(api_key_for(s, prov)), "data_dir": DATA_DIR,
-            "presets": persona.presets_payload(), "tts": c.tts_info(),
+            "has_key": self._has_ai(), "data_dir": DATA_DIR,
+            "presets": persona.presets_payload(), "tts": c.tts_info(), "local": c.local_info(),
             "lite_model": c.brain.models()[1],
+            "memory": self.memory_info(),
+            "follow": c.follow_info(), "pc_hearing": c.pc_hearing_info(),
         }
         self._ready.set()
         log.info("UI connected (js init)")
@@ -310,7 +324,42 @@ class Bridge:
                 pass
         s = self._core.settings
         return {"ok": True, "settings": self._settings_payload(), "hotkey": hotkey_pretty(s["hotkey"]),
-                "has_key": bool(api_key_for(s, s["provider"]))}
+                "has_key": self._has_ai()}
+
+    def _has_ai(self) -> bool:
+        """A cloud key, or a usable local model (then no key is needed at all)."""
+        s = self._core.settings
+        return bool(api_key_for(s, s["provider"])) or (s["ai_route"] != "cloud" and self._core.local.available())
+
+    # ── v1.5 local model ──
+    def local_info(self, refresh: bool = False) -> dict:
+        if refresh:
+            self._core.local.refresh()
+        return self._core.local_info()
+
+    def local_pull(self, name: str) -> dict:
+        name = str(name or "").strip()
+        if not re.fullmatch(r"[a-zA-Z0-9._/-]{1,80}(?::[a-zA-Z0-9._-]{1,60})?", name):
+            return {"ok": False, "error": "непонятное имя модели"}
+        if not self._core.local.mgr.installed() and not self._core.local.mgr.running():
+            return {"ok": False, "error": "Ollama не установлена", "need_install": True}
+        return {"ok": self._core.local.pull_async(name)}
+
+    def local_cancel_pull(self) -> dict:
+        self._core.local.mgr.cancel_pull()
+        return {"ok": True}
+
+    def local_start(self) -> dict:
+        ok = self._core.local.start_server()
+        return {"ok": ok, "local": self._core.local_info()}
+
+    def local_unload(self) -> dict:
+        self._core.local.unload()
+        return {"ok": True, "local": self._core.local_info()}
+
+    def local_load(self) -> dict:
+        self._core.local.warm_async()
+        return {"ok": True}
 
     def set_wake(self, on: bool) -> dict:
         """Home-card chip: off → by name (or the last mode), on → off."""
@@ -332,17 +381,58 @@ class Bridge:
         self._core.set_live(bool(on))
         s = self._core.settings
         return {"ok": True, "settings": self._settings_payload(), "hotkey": hotkey_pretty(s["hotkey"]),
-                "has_key": bool(api_key_for(s, s["provider"])),
+                "has_key": self._has_ai(),
                 "live": {"enabled": bool(s["live_mode"]), "status": self._core.live_status}}
+
+    # ── v1.6 conversation mode / PC hearing ──
+    def follow_stop(self) -> dict:
+        r = self._core.follow_stop()
+        r["follow"] = self._core.follow_info()
+        return r
+
+    def follow_info(self) -> dict:
+        return self._core.follow_info()
+
+    def pc_hearing_info(self) -> dict:
+        d = self._core.pc_hearing_info()
+        d["recent"] = [{"t": datetime.fromtimestamp(at).strftime("%H:%M:%S"), "text": text[:160], "window": title}
+                       for at, text, title in self._core.pc.transcript.items()[-6:]]
+        return d
 
     def test_ai(self, provider: str, patch: dict | None = None) -> str:
         from .brain import Brain
         tmp = normalize_settings(_deep_merge(self._core.settings, patch or {}))
         try:
+            if provider == "ollama":
+                self._core.local.mgr.ensure_running()
             return Brain(lambda: tmp, None).test_connection(provider or tmp["provider"])
         except Exception as e:
             from .providers import friendly_error
             return friendly_error(e)
+
+    def list_models(self, provider: str, patch: dict | None = None) -> dict:
+        """«Обновить список моделей»: GET {base}/models of an OpenAI-compatible provider with the key from
+        the form (not necessarily saved yet). The key never leaves this process except to that API."""
+        from .providers import OpenAICompatProvider, friendly_error
+        from .config import OPENAI_COMPAT
+        provider = str(provider or "")
+        if provider not in OPENAI_COMPAT:
+            return {"ok": False, "error": "Список моделей есть только у OpenAI-совместимых провайдеров"}
+        tmp = normalize_settings(_deep_merge(self._core.settings, patch or {}))
+        key = api_key_for(tmp, provider)
+        base = (tmp.get("base_urls") or {}).get(provider) or PROVIDERS[provider]["base_url"]
+        if not base:
+            return {"ok": False, "error": "Сначала впиши адрес API (base URL)"}
+        try:
+            prov = OpenAICompatProvider(key or "-", base, name=provider)
+            models = prov.list_models()
+        except Exception as e:
+            if not key and getattr(e, "status", None) in (401, 403):
+                return {"ok": False, "error": "Нужен API-ключ — вставь его и нажми ещё раз"}
+            log.info("list_models %s failed: %s", provider, getattr(e, "detail", "") or e)
+            return {"ok": False, "error": friendly_error(e)}
+        log.info("list_models %s: %d models", provider, len(models))
+        return {"ok": True, "models": models[:1500], "count": len(models)}
 
     def tts_info(self) -> dict:
         return self._core.tts_info()
@@ -350,6 +440,22 @@ class Bridge:
     def download_voice(self, key: str) -> dict:
         ok = self._core.download_voice(str(key or ""))
         return {"ok": ok, "tts": self._core.tts_info()}
+
+    # v1.5.x optional Whisper STT
+    def whisper_info(self) -> dict:
+        return self._core.whisper_info()
+
+    def whisper_download(self, model: str = "") -> dict:
+        ok = self._core.download_whisper(str(model or "") or None)
+        return {"ok": ok, "whisper": self._core.whisper_info()}
+
+    def whisper_cancel(self) -> dict:
+        self._core.cancel_whisper_download()
+        return {"ok": True}
+
+    def whisper_delete(self, model: str) -> dict:
+        r = self._core.delete_whisper(str(model or ""))
+        return dict(r, whisper=self._core.whisper_info())
 
     def test_voice(self, voice: str = "", rate: int | None = None, volume: int | None = None,
                    engine: str = "", piper_voice: str = "", lang: str = "") -> dict:
@@ -447,6 +553,19 @@ class Bridge:
         return self._stats_payload()
 
     # misc
+    def phone_info(self) -> dict:
+        phone = getattr(self._core, "phone", None)
+        if phone is None:
+            return {"ok": False, "enabled": False, "error": "пульт не запущен"}
+        return phone.info()
+
+    def phone_rotate(self) -> dict:
+        phone = getattr(self._core, "phone", None)
+        if phone is None:
+            return {"ok": False, "error": "пульт не запущен"}
+        phone.rotate()
+        return phone.info()
+
     def open_data_folder(self) -> None:
         try:
             ensure_dir(DATA_DIR)
@@ -456,11 +575,38 @@ class Bridge:
             pass
 
     def open_link(self, url: str) -> None:
-        if isinstance(url, str) and url.startswith("https://"):
-            import webbrowser
+        import webbrowser
+        if url:
             webbrowser.open(url)
 
-    # versions (GitHub Releases of Sinohara1/jarvis-releases)
+    # ── companion memory (ИИ → Память) ──
+    def memory_info(self) -> dict:
+        mem = getattr(self._core, "memory", None)
+        if mem is None:
+            return {"ok": False, "facts": [], "count": 0, "categories": [], "error": "память не запустилась"}
+        return mem.payload()
+
+    def _memory_call(self, fn) -> dict:
+        mem = getattr(self._core, "memory", None)
+        if mem is None:
+            return {"ok": False, "error": "память не запустилась"}
+        r = fn(mem)
+        return dict(r, memory=mem.payload())
+
+    def memory_add(self, text: str, category: str = "") -> dict:
+        return self._memory_call(lambda m: m.add(str(text or ""), str(category or "") or None, source="ui"))
+
+    def memory_update(self, fact_id: str, text: str | None = None, category: str | None = None,
+                      pinned: bool | None = None) -> dict:
+        return self._memory_call(lambda m: m.update(str(fact_id or ""), text, category, pinned))
+
+    def memory_delete(self, fact_id: str) -> dict:
+        return self._memory_call(lambda m: m.delete(str(fact_id or "")))
+
+    def memory_clear(self) -> dict:
+        return self._memory_call(lambda m: m.clear())
+
+    # versions (GitHub Releases of Sinohara1/jarvis)
     def list_versions(self, force: bool = False) -> dict:
         try:
             rels = updater.list_releases(force=bool(force))
@@ -612,6 +758,13 @@ class Bridge:
 
     def _after_start(self) -> None:
         self._core.start()
+        try:
+            from .remote import PhoneServer
+            self._core.phone = PhoneServer(self._core)
+            self._core.phone.start()
+        except Exception:
+            log.exception("phone bridge failed")
+            self._core.phone = None
         threading.Thread(target=self._pump, name="ui-pump", daemon=True).start()
         threading.Thread(target=self._ticker, name="ui-ticker", daemon=True).start()
         threading.Thread(target=self._update_check, name="update-check", daemon=True).start()

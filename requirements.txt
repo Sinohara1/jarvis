@@ -10,3 +10,8 @@ pywebview
 pyinstaller
 vosk
 piper-tts==1.8.0
+# v1.6 «Слышать звук ПК» (WASAPI loopback, только Windows)
+PyAudioWPatch; sys_platform == "win32"
+# необязательно: Whisper-распознавание речи (Настройки → Голос → «Распознавание речи (офлайн)»).
+# Без него сборка работает только с Vosk. Модели и CUDA приложение скачивает само.
+# faster-whisper>=1.1

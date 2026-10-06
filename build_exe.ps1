@@ -33,11 +33,42 @@ if (Test-Path -LiteralPath $EspeakDst) { Remove-Item -LiteralPath $EspeakDst -Re
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $EspeakDst) | Out-Null
 Copy-Item -LiteralPath $EspeakSrc -Destination $EspeakDst -Recurse
 
+# Optional Whisper STT (v1.5.x): bundled only when faster-whisper is installed in .venv
+#   & .venv\Scripts\python.exe -m pip install "faster-whisper>=1.1"
+# Adds ~60-100 MB to the exe (ctranslate2 + PyAV/ffmpeg + tokenizers). Models and the CUDA (cuBLAS)
+# DLLs are NOT bundled - the app downloads them on demand into %LOCALAPPDATA%\Jarvis\whisper.
+$WhisperArgs = @()
+& $Py -c "import importlib.util as u, sys; sys.exit(0 if u.find_spec('faster_whisper') and u.find_spec('ctranslate2') else 1)"
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "faster-whisper found - bundling the optional Whisper engine"
+    $WhisperArgs = @("--collect-all", "faster_whisper", "--collect-all", "ctranslate2",
+                     "--collect-binaries", "av", "--collect-submodules", "av", "--hidden-import", "av",
+                     "--collect-all", "tokenizers", "--hidden-import", "huggingface_hub")
+} else {
+    Write-Host "faster-whisper not installed - building without Whisper (Vosk only)"
+}
+
+# v1.6 "hear PC audio": WASAPI loopback via PyAudioWPatch (small, ~1 MB). Installed automatically if missing.
+& $Py -c "import importlib.util as u, sys; sys.exit(0 if u.find_spec('pyaudiowpatch') else 1)"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Installing PyAudioWPatch (PC audio loopback)..."
+    & $Py -m pip install --disable-pip-version-check -q PyAudioWPatch
+}
+$LoopbackArgs = @()
+& $Py -c "import pyaudiowpatch"
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "PyAudioWPatch found - bundling PC audio hearing"
+    $LoopbackArgs = @("--hidden-import", "pyaudiowpatch", "--collect-binaries", "pyaudiowpatch")
+} else {
+    Write-Host "PyAudioWPatch not available - building without PC audio hearing"
+}
+
 & $Py -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name Jarvis `
     --icon jarvis.ico `
     --add-data "models;models" `
     --add-data "web;web" `
+    --add-data "phone;phone" `
     --hidden-import pystray._win32 `
     --hidden-import clr `
     --collect-all vosk `
@@ -48,6 +79,8 @@ Copy-Item -LiteralPath $EspeakSrc -Destination $EspeakDst -Recurse
     --exclude-module piper.phonemize_thai --exclude-module piper.phonemize_hebrew --exclude-module piper.g2pw_onnx `
     --exclude-module matplotlib --exclude-module scipy --exclude-module pandas `
     --exclude-module tkinter --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide6 --exclude-module gi `
+    @WhisperArgs `
+    @LoopbackArgs `
     jarvis.pyw
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE)" }
 

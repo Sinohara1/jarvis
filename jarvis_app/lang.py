@@ -15,7 +15,8 @@ CODES = ("ru", "uk", "en", "de", "pl")
 
 LANGS: dict[str, dict] = {
     "ru": {
-        "label": "Русский", "short": "RU", "rule": "по-русски", "native_rule": "",
+        "label": "Русский", "short": "RU", "rule": "по-русски",
+        "native_rule": "Отвечай только по-русски. Never reply in English unless the user explicitly asked for English.",
         "name_gen": "русский",
         "edge": {"м": "ru-RU-DmitryNeural", "ж": "ru-RU-SvetlanaNeural"},
         "vosk": ("vosk-model-small-ru-0.22", 46_236_750),
@@ -261,7 +262,9 @@ def turn_rule(settings: dict, code: str) -> str:
     else:
         line = (f"\nЯзык этого ответа: {L['rule']} — даже если вопрос задан по-русски или на другом языке. "
                 f"{L['native_rule']}")
-    if code != "ru":
+    if code == "ru":
+        line += " Весь ответ целиком по-русски, без английских фраз и без перевода вопроса на English."
+    else:
         line += " Весь ответ целиком на этом языке, не переходи на русский посреди фразы."
         if code == "uk":
             line += " Это украинский, не русский: украинская лексика и буквы і, ї, є, ґ."

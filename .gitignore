@@ -12,6 +12,7 @@ gh_token
 gh_token*
 update_token*
 settings.json
+memory.json
 chat.json
 stats.json
 distractions.json
@@ -22,3 +23,27 @@ webview/
 !web/**/*.png
 *.zip
 build_assets/
+
+# build output / bundled assets (never commit)
+_builds/
+build_assets/piper_espeak/
+*.msi
+*.whl
+
+# user data (lives in %LOCALAPPDATA%\Jarvis or data/ in portable mode)
+data/
+portable.txt
+phone.json
+tavern.json
+addons_backup_*.zip
+*.sqlite
+*.sqlite3
+*.db
+*.wav
+*.mp3
+voices/
+whisper/
+models/piper/
+models/vosk*/
+logs/
+.pytest_cache/

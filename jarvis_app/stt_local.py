@@ -112,3 +112,79 @@ def acceptable(text: str, conf: float, min_conf: float = 0.55) -> bool:
     if len(t.replace(" ", "")) < 2:
         return False
     return conf >= min_conf
+
+
+# ─── bilingual second pass (v1.5.x) ──────────────────────────────────────────
+# The Russian small model can only spell English in Cyrillic («райт нехто он телеграм…»). When a
+# Russian transcript looks like an English command (stt_commands.wants_english_pass) the same WAV is
+# decoded once more with the small English model (~41 MB, downloaded lazily the first time such a
+# phrase is heard; ~0.5 s load once, then ~50–150 ms per short phrase) and the better reading wins.
+
+# English model used for that pass: the small one (41 MB) or, on request («stt_en_model»: "lgraph"),
+# vosk-model-en-us-0.22-lgraph (128 MB, WER 7.8 vs 9.9 on LibriSpeech, still fast on CPU).
+EN_PASS_MODELS = {"lgraph": ("vosk-model-en-us-0.22-lgraph", 130_557_655)}
+
+_en_dl: dict[str, threading.Event] = {}
+
+
+def _en_path(variant: str) -> str | None:
+    if variant in EN_PASS_MODELS:
+        from .namewake import find_model
+        return find_model(EN_PASS_MODELS[variant][0])
+    return model_path("en")
+
+
+def _download_en(variant: str) -> str:
+    if variant in EN_PASS_MODELS:
+        from .namewake import download_model
+        name, size = EN_PASS_MODELS[variant]
+        return download_model(None, url=f"https://alphacephei.com/vosk/models/{name}.zip", name=name, size=size)
+    return download("en")
+
+
+def english_model(*, allow_download: bool = True, variant: str = "small"):
+    """The loaded English Vosk model, or None. Never blocks on a download: if the model is missing
+    and ``allow_download`` it is fetched in the background and used from the next phrase on. A missing
+    «lgraph» model falls back to the small one meanwhile."""
+    variant = variant if variant in EN_PASS_MODELS else "small"
+    try:
+        path = _en_path(variant)
+    except Exception:
+        path = None
+    if path:
+        try:
+            return get_model(path)
+        except Exception as e:
+            log.warning("english stt model (%s) load failed: %s", variant, e)
+            return None
+    ev = _en_dl.setdefault(variant, threading.Event())
+    if allow_download and not ev.is_set():
+        ev.set()
+
+        def work() -> None:
+            try:
+                log.info("bilingual stt: downloading the English Vosk model %s (once)", variant)
+                p = _download_en(variant)
+                get_model(p)
+                log.info("bilingual stt: English model %s ready", variant)
+            except Exception as e:
+                log.warning("bilingual stt: English model %s download failed: %s", variant, e)
+                ev.clear()
+        threading.Thread(target=work, name=f"vosk-download-en-{variant}", daemon=True).start()
+    if variant != "small":
+        return english_model(allow_download=False, variant="small")
+    return None
+
+
+def english_pass(wav: bytes | None, *, allow_download: bool = True, variant: str = "small") -> tuple[str, float] | None:
+    """Decode ``wav`` (16 kHz mono) with the English model → (text, conf), or None if unavailable."""
+    if not wav:
+        return None
+    model = english_model(allow_download=allow_download, variant=variant)
+    if model is None:
+        return None
+    try:
+        return transcribe_wav(model, wav)
+    except Exception as e:
+        log.warning("bilingual stt pass failed: %s", e)
+        return None

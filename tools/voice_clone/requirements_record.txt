@@ -1,0 +1,4 @@
+# Optional deps for record_voice.py (Windows / PowerShell)
+sounddevice>=0.4.6
+numpy>=1.24
+# Alternative: install ffmpeg and use: record_voice.ps1 -Backend ffmpeg

@@ -29,6 +29,8 @@ ap.add_argument("--log", default="", help="write the app log here (INFO)")
 ap.add_argument("--speech-lang", default="", help="ru|uk|en|de|pl — the language of the WAVs")
 ap.add_argument("--answer-lang", default="", help="auto|ru|uk|en|de|pl")
 ap.add_argument("--import-voice", default="", help="import this Piper .onnx/.zip as a custom voice first (deleted after)")
+ap.add_argument("--route", default="", help="v1.5: local_first|local|cloud (where the reply is generated)")
+ap.add_argument("--local-model", default="", help="v1.5: Ollama model for the local route (warmed up before the run)")
 a = ap.parse_args()
 if a.log:
     from jarvis_app.config import setup_logging
@@ -100,6 +102,8 @@ if a.fast: s["fast_replies"] = a.fast == "1"
 if a.silence_ms: s["vad_silence_ms"] = a.silence_ms
 if a.speech_lang: s["speech_lang"] = a.speech_lang
 if a.answer_lang: s["answer_lang"] = a.answer_lang
+if a.route: s["ai_route"] = a.route
+if a.local_model: s["models"] = dict(s["models"], ollama={"chat": a.local_model, "lite": a.local_model})
 s["speak_replies"] = True
 core.settings = config.normalize_settings(s)  # not saved to disk
 hub = FakeHub()
@@ -127,6 +131,11 @@ for _ in range(200):  # wait for the piper voice / vosk model download + load
     if voice_ok and stt_ok:
         break
     time.sleep(1)
+if core.settings.get("ai_route") != "cloud":
+    core.local.mgr.ensure_running()
+    m = core.local.model()
+    t0 = time.monotonic(); core.local.mgr.load(m, 10, timeout=300); core.local.refresh()
+    print(f"local model {m} ready in {time.monotonic() - t0:.1f}s: {core.local.mgr.is_loaded(m)}", flush=True)
 print(f"ready: voice={core.speaker.piper_key(core.settings, core._reply_lang())} "
       f"stt={stt_local.model_path(L.speech_lang(core.settings))}", flush=True)
 
@@ -143,7 +152,7 @@ for i in [int(x) for x in a.ids.split(",")][:a.n]:
     err = next((d["text"] for e, d in events if e == "chat" and d.get("role") == "system"), "")
     # first_audio from the core is measured from the VAD's last voiced chunk; also report vs the true end of speech
     at = timing.pop("_at", None)
-    r = dict(q=texts[i], heard=heard, reply=reply[:90], error=err, ok=ok, **timing)
+    r = dict(q=texts[i], heard=heard, reply=reply[:90], error=err, ok=ok, via=core.brain.last_provider, **timing)
     r["reply_lang"] = L.detect(reply) if reply else None
     r["voice"] = core.speaker.last_voice
     # the core measures from the VAD's last voiced chunk; this is from the true end of the WAV's speech

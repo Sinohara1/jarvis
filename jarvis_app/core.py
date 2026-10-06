@@ -7,6 +7,7 @@ import itertools
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -16,12 +17,17 @@ from .actions import Actions
 from .audio import MicHub, Recording, SentenceSplitter, Speaker, VoiceTurn, beep
 from .brain import Brain, TurnCancelled, context_line
 from . import lang as L
-from . import stt_local, tts_local
+from . import stt_local, stt_whisper, tts_local
+from .stt_normalize import normalize_transcript
+from .stt_commands import english_hint, pick_bilingual, voice_names
 from . import persona
 from .config import load_settings, normalize_settings, register_secrets, save_settings
+from .converse import FollowListener, FollowSession, echo_match, fmt_left, is_stop_phrase, junk_reason
+from .pc_audio import PCHearing, backend_available as pc_backend_available
 from .focus import FocusSession, Stats, fmt_clock
 from .hotkey import Hotkey
 from .live import LivePolicy, build_prompt, live_intent, talk_params
+from .local_ai import LocalController
 from .watcher import (Foreground, NudgePolicy, capture_screen_jpeg, get_foreground, is_call,
                       is_fullscreen, match_distraction, nudge_text)
 
@@ -32,6 +38,13 @@ log = logging.getLogger("jarvis")
 TOOL_ACK = {"open_app": "Открываю.", "open_url": "Открываю.", "open_path": "Открываю.", "web_search": "Ищу.",
             "find_files": "Ищу файлы.", "start_focus": "Запускаю фокус.", "stop_focus": "Останавливаю.",
             "set_reminder": "Ставлю напоминание.", "cancel_reminders": "Отменяю.", "look_at_screen": "Смотрю на экран."}
+
+
+# «хватит» in conversation mode: short confirmation in the reply language
+FOLLOW_BYE = {"ru": "Хорошо, не слушаю. Позови по имени.", "uk": "Добре, не слухаю. Поклич на ім'я.",
+              "en": "Okay, I'll stop listening. Call me by name.", "de": "Okay, ich höre nicht mehr zu.",
+              "pl": "Dobrze, nie słucham. Zawołaj mnie po imieniu."}
+TTS_TAIL_SEC = 0.5   # the room echo of her last word: the mic is ignored a bit after TTS ends
 
 
 def _same_ack(sentence: str, ack: str) -> bool:
@@ -60,9 +73,23 @@ class JarvisCore:
         self._piper_failed: set[str] = set()
         self._stt_dl: str | None = None
         self._stt_err: str | None = None
+        self._whisper_dl: str | None = None    # model being downloaded ("" while only cuBLAS is)
+        self._whisper_err: str | None = None
         self.last_timing: dict | None = None
         self.actions = Actions(self)
         self.brain = Brain(lambda: self.settings, self.actions, self._context)
+        # companion memory: %LOCALAPPDATA%\Jarvis\memory.json (facts, preferences, people, projects)
+        try:
+            from .memory import MemoryStore
+            self.memory = MemoryStore(get_settings=lambda: self.settings,
+                                      on_change=lambda what, n: self.emit("memory", what=what, count=n))
+        except Exception:
+            log.exception("memory failed to start")
+            self.memory = None
+        self.brain.memory = self.memory
+        # v1.5: local model (Ollama) — routing, warm-up, «free the GPU in games»
+        self.local = LocalController(lambda: self.settings, emit=self.emit, foreground=self._fg_for_games)
+        self.brain.local = self.local
         self.policy = NudgePolicy(cooldown=self.settings["nudge_cooldown_sec"],
                                   grace=self.settings["distraction_grace_sec"])
         self.state = "idle"
@@ -98,6 +125,20 @@ class JarvisCore:
         if self.settings["live_mode"]:
             self.live.reset(time.monotonic())
             self.live_status = "Включён — присматриваюсь"
+        self._init_listen_state()
+
+    def _init_listen_state(self) -> None:
+        """v1.6 conversation mode («Слушать после ответа») + «Слышать звук ПК» (no threads started here)."""
+        self._answering = getattr(self, "_answering", False)
+        self.follow = FollowSession(self.settings.get("follow_mode", "2m"))
+        self.follow_listener: FollowListener | None = None
+        self._follow_busy = False          # a follow-up phrase is being recognised / answered
+        self._tts_tail_until = 0.0
+        self._last_reply = ""              # her last reply (echo filter for the «всегда» mode)
+        self._follow_emitted: tuple | None = None
+        self._listen_lock = threading.Lock()
+        self.pc = PCHearing(lambda: self.settings, transcribe=self._pc_transcribe, foreground=self._fg_title,
+                            on_status=lambda _t: self.emit("pc_hearing", **self.pc_hearing_info()))
 
     # ── lifecycle ──
     def start(self) -> None:
@@ -105,9 +146,24 @@ class JarvisCore:
         threading.Thread(target=self._ticker, name="ticker", daemon=True).start()
         self._apply_hotkey()
         self._apply_wake()
+        self._apply_follow()
+        ok, err = pc_backend_available()
+        log.info("pc hearing: loopback backend %s%s", "import OK" if ok else "unavailable", "" if ok else f" ({err})")
+        if self.settings.get("pc_hearing"):
+            self.pc.start()
         threading.Thread(target=self._prepare_voice, name="voice-prepare", daemon=True).start()
-        log.info("core started; provider=%s chat=%s lite=%s", self.settings["provider"],
-                 *self.brain.models())
+        self.local.start()
+        log.info("core started; provider=%s chat=%s lite=%s; ai_route=%s local=%s", self.settings["provider"],
+                 *self.brain.models(), self.settings["ai_route"], self.local.model())
+
+    def _fg_for_games(self) -> tuple[str, str, bool, int]:
+        fg = get_foreground()
+        if not fg.process or fg.pid == os.getpid():
+            return "", "", False, 0
+        return fg.process, fg.path, is_fullscreen(fg), fg.pid
+
+    def local_info(self) -> dict:
+        return self.local.state()
 
     # ── fast voice (v1.3) + languages (v1.4): local TTS + local STT preparation ──
     def _reply_lang(self) -> str:
@@ -120,6 +176,7 @@ class JarvisCore:
             self.ensure_piper_voice(tts_local.voice_for_lang(s, self._reply_lang()))
         if s["stt_mode"] == "local":
             self._ensure_stt_model()
+            self._ensure_whisper()
 
     def ensure_piper_voice(self, key: str) -> None:
         if not key:
@@ -218,6 +275,7 @@ class JarvisCore:
                 "downloading": self._piper_dl[0] if self._piper_dl else None, "downloads": list(self._piper_dl),
                 "error": self._piper_err, "available": tts_local.available(),
                 "active": self.speaker.engine_for(s, rl), "stt": self.stt_info(), "timing": self.last_timing,
+                "whisper": self.whisper_info(),
                 "langs": L.payload(), "links": list(tts_local.LINKS)}
 
     def _emit_tts(self) -> None:
@@ -266,6 +324,142 @@ class JarvisCore:
             self._emit_tts()
         threading.Thread(target=work, name=f"vosk-download-{code}", daemon=True).start()
 
+    # ── v1.5.x optional Whisper (faster-whisper) STT ──
+    def _whisper_wanted(self) -> bool:
+        s = self.settings
+        return s["stt_mode"] == "local" and s.get("stt_engine") == "whisper"
+
+    def _whisper_ready(self) -> bool:
+        return self._whisper_wanted() and stt_whisper.engine().ready(self.settings.get("whisper_model"))
+
+    def whisper_info(self) -> dict:
+        s = self.settings
+        try:
+            eng = stt_whisper.engine().info()
+            # cheap on the UI thread: the real import / nvidia-smi run in _ensure_whisper (background)
+            available = stt_whisper.package_present()
+            gpu = stt_whisper.nvidia_gpu(probe=False)
+            cuda = stt_whisper.cuda_installed()
+            catalog = stt_whisper.catalog()
+        except Exception as e:  # never break the settings page because of the optional engine
+            log.warning("whisper info failed: %s", e)
+            eng, available, gpu, cuda, catalog = {}, False, "", False, []
+        return {"engine": s.get("stt_engine", "vosk"), "model": s.get("whisper_model"),
+                "device_pref": s.get("whisper_device"), "lang_mode": s.get("whisper_lang"),
+                "available": available, "import_error": "" if available else stt_whisper.import_error(),
+                "gpu": gpu, "cuda": cuda, "catalog": catalog, "downloading": self._whisper_dl,
+                "error": self._whisper_err or eng.get("error") or None, **{k: eng.get(k) for k in (
+                    "loaded", "device", "compute", "loading", "gpu_error", "load_sec")},
+                "loaded_model": eng.get("model", "")}
+
+    def _emit_whisper(self) -> None:
+        self.emit("whisper", **self.whisper_info())
+
+    def _ensure_whisper(self) -> None:
+        """engine = whisper and the model is on disk → load it (GPU if possible). Never downloads by itself:
+        1.6 GB (+0.55 GB cuBLAS) only after «Скачать» in the settings."""
+        if not self._whisper_wanted():
+            return
+        s = self.settings
+        name = s.get("whisper_model")
+        eng = stt_whisper.engine()
+        stt_whisper.nvidia_gpu()  # probe once in the background so the settings page can show the GPU
+        if eng.loading or not stt_whisper.available() or not stt_whisper.installed(name):
+            self._emit_whisper()
+            return
+        if eng.ready(name) and s.get("whisper_device") in ("auto", eng.device):
+            return
+        self._whisper_err = None
+        self._emit_whisper()
+        eng.load(name, s.get("whisper_device", "auto"))
+        self._emit_whisper()
+
+    def _whisper_settings_changed(self, old: dict) -> None:
+        s = self.settings
+        keys = ("stt_mode", "stt_engine", "whisper_model", "whisper_device")
+        if all(old.get(k) == s.get(k) for k in keys):
+            return
+        if not self._whisper_wanted():
+            if stt_whisper.engine().model is not None:
+                stt_whisper.engine().unload()  # frees 1.5–3 GB of VRAM/RAM for games and Ollama
+                log.info("whisper unloaded (engine=%s, stt_mode=%s)", s.get("stt_engine"), s["stt_mode"])
+            self._emit_whisper()
+            return
+        threading.Thread(target=self._ensure_whisper, name="whisper-load", daemon=True).start()
+
+    def download_whisper(self, model: str | None = None) -> bool:
+        """«Скачать» in the settings: the model (+ cuBLAS for an NVIDIA GPU) into %LOCALAPPDATA%\\Jarvis\\whisper."""
+        name = stt_whisper.norm_model(model or self.settings.get("whisper_model"))
+        if self._whisper_dl is not None:
+            return True
+        if not stt_whisper.available():
+            self._whisper_err = "faster-whisper не входит в эту сборку — пересоберите exe с ним"
+            self._emit_whisper()
+            return False
+        self._whisper_dl, self._whisper_err = name, None
+        self._emit_whisper()
+
+        def work() -> None:
+            try:
+                need_cuda = (self.settings.get("whisper_device") != "cpu" and stt_whisper.nvidia_gpu()
+                             and not stt_whisper.cuda_installed() and not stt_whisper._cublas_on_path())
+                if need_cuda:
+                    stt_whisper.download_cuda(lambda d, t: self.emit("whisper_dl", stage="cuda", model=name,
+                                                                     done=d, total=t))
+                stt_whisper.download_model(name, lambda d, t: self.emit("whisper_dl", stage="model", model=name,
+                                                                        done=d, total=t))
+                self._whisper_dl = None
+                if name != self.settings.get("whisper_model"):
+                    new = dict(self.settings, whisper_model=name)
+                    self.apply_settings(new)  # loads it if engine = whisper
+                else:
+                    self._ensure_whisper()
+            except stt_whisper.Cancelled:
+                self._whisper_err = "загрузка отменена"
+            except Exception as e:
+                self._whisper_err = f"не удалось скачать: {e}"[:220]
+                log.error("whisper download failed: %s", e)
+            finally:
+                self._whisper_dl = None
+            self._emit_whisper()
+        threading.Thread(target=work, name="whisper-download", daemon=True).start()
+        return True
+
+    def cancel_whisper_download(self) -> None:
+        stt_whisper.cancel_download()
+
+    def delete_whisper(self, model: str) -> dict:
+        name = stt_whisper.norm_model(model)
+        eng = stt_whisper.engine()
+        if eng.name == name:
+            eng.unload()  # Windows keeps model.bin locked while loaded
+        ok = stt_whisper.delete_model(name)
+        self._emit_whisper()
+        return {"ok": ok}
+
+    def _whisper_transcribe(self, wav: bytes | None, turn: VoiceTurn) -> str:
+        """Whisper pass for a finished phrase. '' = not ready / nothing / not confident → caller falls back."""
+        if not wav or not self._whisper_ready():
+            return ""
+        s = self.settings
+        code = L.speech_lang(s)
+        t0 = time.monotonic()
+        try:
+            # no initial prompt: it made Whisper worse in tests; names are fixed by normalize_transcript later
+            text, conf, lang = stt_whisper.engine().transcribe(wav, lang_mode=s.get("whisper_lang", "pair"),
+                                                               speech_lang=code, prompt="")
+        except Exception as e:
+            log.warning("whisper transcribe failed: %s", e)
+            return ""
+        ms = 1000 * (time.monotonic() - t0)
+        if not text or conf < 0.35:
+            log.info("whisper not confident (%r, conf %.2f, %s) in %.0f ms → fallback", text[:80], conf, lang, ms)
+            return ""
+        log.info("whisper [%s/%s]: %r (conf %.2f, lang %s) in %.0f ms", stt_whisper.engine().name,
+                 stt_whisper.engine().device, text[:120], conf, lang, ms)
+        turn.stt, turn.lang = "whisper", lang or ""
+        return text
+
     def shutdown(self) -> None:
         self._stop.set()
         try:
@@ -277,11 +471,25 @@ class JarvisCore:
             self.hotkey.stop()
         if self.wake:
             self.wake.stop()
+        if self.follow_listener:
+            self.follow_listener.stop()
+        try:
+            self.pc.stop()
+        except Exception:
+            pass
         if self._rec:
             self._rec.cancel()
         self.speaker.shutdown()
         self.mic.close()
         self._jobs.put(None)
+        try:
+            self.local.stop()
+            self.local.shutdown()
+        except Exception:
+            pass
+        phone = getattr(self, "phone", None)
+        if phone is not None:
+            phone.stop()
 
     # ── settings ──
     def apply_settings(self, new: dict) -> None:
@@ -305,9 +513,10 @@ class JarvisCore:
             self._apply_wake()
         if old["live_mode"] != self.settings["live_mode"]:
             self._live_switched(self.settings["live_mode"])
-        if old["provider"] != self.settings["provider"]:
-            self.brain.reset()
         s = self.settings
+        if (old["ai_route"], old["models"]["ollama"], old["base_urls"]["ollama"]) != (
+                s["ai_route"], s["models"]["ollama"], s["base_urls"]["ollama"]):
+            threading.Thread(target=self.local.settings_changed, args=(old,), daemon=True).start()
         if old["answer_lang"] != s["answer_lang"]:
             self.user_lang = None
         voice_now = tts_local.voice_for_lang(s, self._reply_lang())
@@ -317,8 +526,29 @@ class JarvisCore:
             threading.Thread(target=self.ensure_piper_voice, args=(voice_now,), daemon=True).start()
         if s["stt_mode"] == "local" and (old["stt_mode"] != "local" or old["speech_lang"] != s["speech_lang"]):
             threading.Thread(target=self._ensure_stt_model, daemon=True).start()
+        self._whisper_settings_changed(old)
+        if s.get("stt_en_model") == "lgraph" and old.get("stt_en_model") != "lgraph" and s.get("stt_en_pass", True):
+            threading.Thread(target=stt_local.english_model, kwargs={"variant": "lgraph"},
+                             name="vosk-en-lgraph", daemon=True).start()  # 128 MB, once, in the background
         if old["vad_silence_ms"] != s["vad_silence_ms"] and self.wake is not None and hasattr(self.wake, "set_hang"):
             self.wake.set_hang(s["vad_silence_ms"] / 1000.0)
+        if old["vad_silence_ms"] != s["vad_silence_ms"] and self.follow_listener is not None:
+            self.follow_listener.set_hang(s["vad_silence_ms"] / 1000.0)
+        if old.get("follow_mode") != s.get("follow_mode"):
+            self.follow.configure(s["follow_mode"])
+            log.info("conversation mode: %s", s["follow_mode"])
+            self._apply_follow()
+        if bool(old.get("pc_hearing")) != bool(s.get("pc_hearing")):
+            if s.get("pc_hearing"):
+                self.pc.start()
+            else:
+                self.pc.stop()
+            log.info("pc hearing %s", "on" if s.get("pc_hearing") else "off")
+        if self.memory is not None and s.get("memory_max_facts", 100) < old.get("memory_max_facts", 100):
+            try:
+                self.memory.enforce_limit()
+            except Exception:
+                log.exception("memory limit failed")
         self._screen_backoff_until = 0.0
         self._screen_fail = 0
         log.info("settings applied; provider=%s chat=%s lite=%s", self.settings["provider"],
@@ -384,6 +614,7 @@ class JarvisCore:
             self._emit_wake(str(e))
 
     def _check_wake_started(self, listener) -> None:
+        self._sync_listen()
         listener.ready.wait(30)
         if listener.error and self.wake is listener:
             self.wake = None
@@ -413,11 +644,12 @@ class JarvisCore:
         self.emit("state", state=st, detail=detail)
 
     def _on_speaking(self, speaking: bool) -> None:
-        if self.wake:
-            if speaking:
-                self.wake.suspended.set()
-            elif not self._rec:
-                self.wake.suspended.clear()
+        if not speaking:
+            self._tts_tail_until = time.monotonic() + TTS_TAIL_SEC
+            t = threading.Timer(TTS_TAIL_SEC + 0.05, self._sync_listen)  # resume listening right after the tail
+            t.daemon = True
+            t.start()
+        self._sync_listen()
         if speaking:
             if self.state != "listening":
                 self.set_state("speaking")
@@ -478,6 +710,7 @@ class JarvisCore:
         if self._rec is not None or self.state == "thinking":
             return
         self._interrupt()
+        self.local.warm_async()
         det = det or {}
         if request_wav or det.get("request_text"):
             # «Пятница, открой телеграм» in one breath: the request is already recorded (and recognised)
@@ -488,7 +721,20 @@ class JarvisCore:
             text = det.get("request_text") or ""
             code = L.speech_lang(self.settings)
             local = self.settings["stt_mode"] == "local"
-            if local and code == "ru" and stt_local.acceptable(text, det.get("request_conf", 0.0)):
+            rescued = ""
+            if request_wav and self._whisper_ready():
+                # Whisper decodes the request in the worker; the name-spotter's Vosk text is the fallback
+                turn.fallback = text if code == "ru" and stt_local.acceptable(text, det.get("request_conf", 0.0)) else ""
+                self.set_state("thinking", "Распознаю…")
+                self._jobs.put(("voice", (turn, request_wav, "")))
+                return
+            if local and code == "ru" and not stt_local.acceptable(text, det.get("request_conf", 0.0)):
+                rescued = self._english_rescue(text, request_wav)  # «Джарвис, райт … он телеграм …»
+            if rescued:
+                text = rescued
+                turn.stt = "wake-local"
+                turn.mark("text")
+            elif local and code == "ru" and stt_local.acceptable(text, det.get("request_conf", 0.0)):
                 turn.stt = "wake-local"
                 turn.mark("text")
             elif local and code != "ru" and request_wav and stt_local.is_loaded(code):
@@ -514,6 +760,7 @@ class JarvisCore:
         with self._rec_lock:
             if self._rec is not None:
                 return
+            self.local.warm_async()  # he is talking: load the local model now (no-op if loaded / gaming)
             kw = {"no_speech_timeout": float(no_speech_timeout)} if no_speech_timeout else {}
             stt = None
             if self.settings["stt_mode"] == "local":
@@ -531,8 +778,7 @@ class JarvisCore:
                             silence_sec=self.settings["vad_silence_ms"] / 1000.0, **kw)
             self._rec = rec
             self._rec_mode = mode
-        if self.wake:
-            self.wake.suspended.set()
+        self._sync_listen()
         self.set_state("listening")
         beep("listen")
         threading.Thread(target=self._record_thread, args=(rec, mode), name="recorder", daemon=True).start()
@@ -548,20 +794,27 @@ class JarvisCore:
             with self._rec_lock:
                 self._rec = None
                 self._rec_mode = None
-            if self.wake and not self.speaker.speaking:
-                self.wake.suspended.clear()
+            self._sync_listen()
         beep("stop")
         if wav and rec.speech_detected:
             turn = VoiceTurn("voice")
             turn.mark("speech_end", rec.t_speech_end)
             turn.mark("rec_end", rec.t_end)
             text = ""
-            if rec.stt is not None and stt_local.acceptable(rec.text, rec.conf):
+            if self._whisper_ready():
+                # Whisper decodes the whole phrase in the worker; Vosk's streaming text is only the fallback
+                turn.fallback = rec.text if rec.stt is not None and stt_local.acceptable(rec.text, rec.conf) else ""
+            elif rec.stt is not None and stt_local.acceptable(rec.text, rec.conf):
                 text = rec.text
                 turn.stt = "local"
                 turn.mark("text")
             elif rec.stt is not None:
-                log.info("local stt not confident (%r, conf %.2f) → cloud", rec.text[:80], rec.conf)
+                text = self._english_rescue(rec.text, wav)
+                if text:
+                    turn.stt = "local"
+                    turn.mark("text")
+                else:
+                    log.info("local stt not confident (%r, conf %.2f) → cloud", rec.text[:80], rec.conf)
             self.set_state("thinking", "Думаю…" if text else "Распознаю…")
             self._jobs.put(("voice", (turn, wav, text)))
         else:
@@ -587,6 +840,13 @@ class JarvisCore:
                 if kind == "voice":
                     turn, wav, text = payload
                     code = L.speech_lang(self.settings)
+                    if not text and wav and self._whisper_ready():
+                        self.set_state("thinking", "Распознаю…")
+                        text = self._whisper_transcribe(wav, turn)
+                        if not text and turn.fallback:
+                            text, turn.stt = turn.fallback, "local"
+                        if text:
+                            turn.mark("text")
                     if not text:
                         self.set_state("thinking", "Распознаю…")
                         turn.stt = "cloud"
@@ -596,13 +856,29 @@ class JarvisCore:
                             self.set_state("idle", "Не расслышал")
                             continue
                         self.user_lang = L.detect(text, prefer=code)
+                    elif turn.stt == "whisper":
+                        self.user_lang = turn.lang if turn.lang in L.LANGS else L.detect(text, prefer=code)
                     else:
                         self.user_lang = code  # the local model only knows its own language
+                    # Fix Vosk mangling of English brand names / spoken English commands before brain/tools
+                    # (Whisper: only the dictionary fixes — its English is fine, no second Vosk pass)
+                    text = self._clean_voice_text(text, wav, code, local=turn.stt not in ("cloud", "whisper"))
+                    if self.follow.active() and is_stop_phrase(text, persona.assistant_name(self.settings)):
+                        self.emit("chat", role="user", text=text)
+                        self._follow_end("voice", say=True)
+                        continue
                     self.emit("chat", role="user", text=text)
-                    self._answer(text, voice=True, turn=turn)
+                    self._answer(text, voice=True, turn=turn, follow_ok=True)
+                elif kind == "follow":
+                    try:
+                        self._follow_job(*payload)
+                    finally:
+                        self._follow_busy = False
+                        self._sync_listen()
                 elif kind == "audio":  # legacy path (kept for tests/tools)
                     self.set_state("thinking", "Распознаю…")
-                    text = self.brain.transcribe(payload)
+                    text = normalize_transcript(self.brain.transcribe(payload), names=voice_names(self.settings),
+                                                assistant_name=persona.assistant_name(self.settings))
                     if not text:
                         self.set_state("idle", "Не расслышал")
                         continue
@@ -612,6 +888,17 @@ class JarvisCore:
                     self.user_lang = L.detect(payload, prefer=self.user_lang or L.speech_lang(self.settings))
                     self.emit("chat", role="user", text=payload)
                     self._answer(payload)
+                elif kind == "phone":
+                    text, speak, box = payload
+                    try:
+                        self.user_lang = L.detect(text, prefer=self.user_lang or L.speech_lang(self.settings))
+                        self.emit("chat", role="user", text=text)
+                        box["reply"] = self._answer(text, voice=bool(speak)) or ""
+                    except Exception as e:
+                        box["error"] = P.friendly_error(e)
+                        self.emit("chat", role="system", text=box["error"])
+                    finally:
+                        box["event"].set()
             except TurnCancelled:
                 log.info("reply cancelled by the user")
                 self.emit("chat_partial", text="", done=True)
@@ -627,8 +914,53 @@ class JarvisCore:
                 self.emit("chat", role="system", text=P.friendly_error(e))
                 self.set_state("idle", "Ошибка")
 
-    def _answer(self, text: str, *, voice: bool = False, turn: VoiceTurn | None = None) -> None:
-        """Stream the reply: each finished sentence goes to TTS while the model keeps writing."""
+    def _clean_voice_text(self, text: str, wav: bytes | None, code: str, *, local: bool) -> str:
+        """Post-STT repair: brand names, spoken English command templates and — when the Russian
+        (or Ukrainian) model obviously heard English — a second decode with the English model."""
+        names = voice_names(self.settings)
+        aname = persona.assistant_name(self.settings)
+        raw = text
+        hint = english_hint(text) if local and code in ("ru", "uk") and wav \
+            and self.settings.get("stt_en_pass", True) and re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", text or "") else 0
+        if hint:
+            t0 = time.monotonic()
+            # weak hint: only if already downloaded
+            en = stt_local.english_pass(wav, allow_download=hint >= 2, variant=self.settings.get("stt_en_model", "small"))
+            if en and en[0]:
+                raw = pick_bilingual(text, en[0], en[1], names=names, assistant_name=aname)
+                log.info("bilingual stt: ru %r / en %r (conf %.2f) → %r in %.0f ms", text[:80], en[0][:80], en[1],
+                         raw[:80], 1000 * (time.monotonic() - t0))
+            else:
+                log.info("bilingual stt: English model not ready yet (ru %r)", text[:80])
+        out = normalize_transcript(raw, names=names, assistant_name=aname)
+        if out != text:
+            log.info("stt fix: %r → %r", text[:120], out[:120])
+        if local and code in ("ru", "uk") and re.search(r"[A-Za-z]", out) and not re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", out):
+            self.user_lang = L.detect(out, prefer=code)  # the local model heard English this time (bilingual pass)
+        return out
+
+    def _english_rescue(self, ru_text: str, wav: bytes | None) -> str:
+        """The Russian model was not confident, but what it heard looks like English («райт … он
+        телеграм»): try the English model before paying for a cloud transcription. '' = no luck."""
+        code = L.speech_lang(self.settings)
+        if code not in ("ru", "uk") or not wav or not self.settings.get("stt_en_pass", True):
+            return ""
+        hint = english_hint(ru_text)
+        if not hint:
+            return ""
+        en = stt_local.english_pass(wav, allow_download=hint >= 2, variant=self.settings.get("stt_en_model", "small"))
+        if not en or not stt_local.acceptable(en[0], en[1], 0.45):
+            return ""
+        out = pick_bilingual(ru_text, en[0], en[1], names=voice_names(self.settings),
+                             assistant_name=persona.assistant_name(self.settings))
+        log.info("bilingual stt rescue: ru %r → en %r (conf %.2f) → %r", ru_text[:80], en[0][:80], en[1], out[:80])
+        return out if not re.search(r"[А-Яа-яЁёІіЇїЄєҐґ]", out) else ""
+
+    def _answer(self, text: str, *, voice: bool = False, turn: VoiceTurn | None = None, follow_ok: bool = False,
+                overheard: str = "", before_output=None) -> str:
+        """Stream the reply: each finished sentence goes to TTS while the model keeps writing.
+        v1.6: follow_ok → a spoken turn opens/extends the conversation window; overheard → the phrase came
+        without the name (the model may stay silent); before_output() runs once before anything is shown."""
         self.set_state("thinking", "Думаю…")
         turn = turn or VoiceTurn("text")
         turn.mark("text")
@@ -649,6 +981,15 @@ class JarvisCore:
         lock = threading.Lock()
         last_delta = [time.monotonic()]
         finished = threading.Event()
+        shown = [before_output is None]
+
+        def first_output() -> None:
+            if not shown[0]:
+                shown[0] = True
+                try:
+                    before_output()
+                except Exception:
+                    log.exception("before_output failed")
 
         def idle_flush() -> None:
             # the model went quiet mid-sentence (usually: now writing a tool call) → say what we have
@@ -672,6 +1013,7 @@ class JarvisCore:
             if "llm_first" not in turn.t:
                 turn.mark("llm_first")
                 turn.model = self.brain.current_model
+            first_output()
             parts.append(delta)
             now = time.monotonic()
             if now - last_ui[0] > 0.12:
@@ -688,6 +1030,7 @@ class JarvisCore:
                 raise TurnCancelled()
             tools_used.append(n)
             turn.model = turn.model or self.brain.current_model
+            first_output()
             self.emit("tool", name=n, args=a)
             if stream is not None:
                 with lock:
@@ -702,14 +1045,15 @@ class JarvisCore:
             threading.Thread(target=idle_flush, name="tts-idle-flush", daemon=True).start()
         try:
             reply = self.brain.ask(text, on_tool=on_tool, on_text=on_text, lang=turn_lang,
-                                   fast=voice and bool(self.settings["fast_replies"]), voice=voice)
+                                   fast=voice and bool(self.settings["fast_replies"]), voice=voice,
+                                   overheard=overheard)
             turn.model = turn.model or self.brain.last_model
             finished.set()
             if stream is not None and not turn.cancelled:
                 with lock:
                     for snt in splitter.flush():
                         speak_sentence(snt)
-                if not parts and not acked:  # nothing was streamed (tool-only answer → «Готово.»)
+                if not parts and not acked and reply:  # nothing was streamed (tool-only answer → «Готово.»)
                     stream.feed(reply)
         finally:
             finished.set()
@@ -721,13 +1065,259 @@ class JarvisCore:
             if want is not None and bool(self.settings.get("live_mode")) != want:
                 log.info("live intent fallback: model did not call set_live_mode -> %s", want)
                 self.set_live(want)
+        silent = bool(overheard) and not reply and not tools_used
+        if silent:
+            if self.state == "thinking":
+                self.set_state("idle")
+            return ""
+        first_output()
+        self._pc_intent_fallback(text, tools_used)
         self.emit("chat", role="jarvis", text=reply)
+        if reply:
+            self._last_reply = reply
+        if follow_ok and self.follow.start():
+            self._sync_listen()
         if not speak or (not self.speaker.speaking and self.speaker.idle):
             if self.state == "thinking":
                 self.set_state("idle")
+        return reply
+
+    def _pc_intent_fallback(self, text: str, tools_used: list) -> None:
+        """The model answered without the right tool (e.g. «не могу выбрать песню») for a clear command:
+        «включи <трек> в спотике» or «открой избранное в телеграме» → run the tool ourselves."""
+        try:
+            from .pc_power import tool_allowed, telegram_saved_intent, telegram_chat_intent
+            from .spotify import spotify_play_intent
+            used = set(tools_used or ())
+            call = None
+            if not used & {"media_control", "app_search", "type_text", "press_hotkey"} and tool_allowed("media_control", settings=self.settings):
+                q = spotify_play_intent(text)
+                if q:
+                    call = ("media_control", {"action": "play", "app": "spotify", "query": q})
+            tg_free = not used & {"telegram_open_chat", "send_telegram", "app_search", "type_text", "press_hotkey"} \
+                and tool_allowed("telegram_open_chat", settings=self.settings)
+            if call is None and tg_free and telegram_saved_intent(text):
+                call = ("telegram_open_chat", {"chat": "Saved Messages"})
+            if call is None and tg_free:
+                # «открой чат с Nehto (в телеграме)» — also right after «открой телеграм» (Telegram in front)
+                tg_ctx = "telegram" in (getattr(self.last_fg, "process", "") or "").lower() or "open_app" in used
+                who = telegram_chat_intent(text, telegram_context=tg_ctx)
+                if who:
+                    call = ("telegram_open_chat", {"chat": who})
+            if call is None:
+                return
+            log.info("pc intent fallback: model did not call a tool -> %s", call[0])
+            self.emit("tool", name=call[0], args=call[1])
+            threading.Thread(target=self.actions.execute, args=call, name="pc-intent-fallback", daemon=True).start()
+        except Exception:
+            log.exception("pc intent fallback failed")
 
     def _context(self) -> str:
-        return context_line(self.session.snapshot(), self.last_fg.title)
+        base = context_line(self.session.snapshot(), self.last_fg.title)
+        pc = self.pc.context_block() if self.settings.get("pc_hearing") else ""
+        return base + ("\n" + pc if pc else "")
+
+    # ── v1.6 conversation mode («Слушать после ответа») ──
+    def _apply_follow(self) -> None:
+        mode = self.settings.get("follow_mode", "2m")
+        if mode == "off":
+            if self.follow_listener is not None:
+                self.follow_listener.stop()
+                self.follow_listener = None
+            self.follow.end("off")
+        else:
+            if self.follow_listener is None:
+                self.follow_listener = FollowListener(self.mic, self._on_follow_utterance,
+                                                      stt_factory=self._follow_stt)
+                self.follow_listener.set_hang(self.settings["vad_silence_ms"] / 1000.0)
+                self.follow_listener.start()
+            if mode == "always":
+                self.follow.start()
+        self._sync_listen()
+
+    def _follow_stt(self):
+        """Streaming Vosk for a follow-up phrase — only when Whisper is not there to decode it afterwards."""
+        if self._whisper_ready():
+            return None
+        code = L.speech_lang(self.settings)
+        path = stt_local.model_path(code)
+        if not path:
+            return None  # no local model for his language: the phrase goes to the cloud (timed modes only)
+        return stt_local.StreamingSTT(stt_local.get_model(path))  # cached after the first load
+
+    def _sync_listen(self) -> None:
+        """Who listens to the mic right now: the name-spotter, the conversation listener, or nobody (she speaks).
+        Called on every state change and by the ticker (session timeout)."""
+        with self._listen_lock:
+            now = time.monotonic()
+            speaking = bool(self.speaker.speaking)
+            tail = now < self._tts_tail_until
+            rec = self._rec is not None
+            self.follow.hold(speaking, now)
+            active = self.follow.active(now)
+            busy = speaking or tail or rec or self._answering or self._follow_busy or self.state == "thinking"
+            listening = active and not busy
+            fl = self.follow_listener
+            if fl is not None:
+                if listening:
+                    fl.enabled.set()
+                else:
+                    fl.enabled.clear()
+            if self.wake is not None:
+                if speaking or rec or active:
+                    self.wake.suspended.set()
+                else:
+                    self.wake.suspended.clear()
+            if speaking or tail:
+                self.pc.paused.set()
+            else:
+                self.pc.paused.clear()
+            snap = self.follow.snapshot(now)
+            rem = snap.get("remaining")
+            key = (snap["active"], snap["mode"], listening, None if rem is None else int(rem))
+            if key != self._follow_emitted:
+                was = self._follow_emitted
+                self._follow_emitted = key
+                if was is not None and was[0] and not snap["active"]:
+                    log.info("conversation mode: window closed (%s)", self.follow.ended_reason or "-")
+                elif snap["active"] and (was is None or not was[0]):
+                    log.info("conversation mode: listening without the name (%s)", snap["mode"])
+                self.emit("follow", **self.follow_info(snap, listening))
+
+    def follow_info(self, snap: dict | None = None, listening: bool | None = None) -> dict:
+        snap = snap or self.follow.snapshot()
+        rem = snap.get("remaining")
+        if listening is None:
+            fl = self.follow_listener
+            listening = bool(fl is not None and fl.enabled.is_set())
+        return {"active": bool(snap["active"]), "mode": snap["mode"], "always": bool(snap.get("always")),
+                "remaining": None if rem is None else int(rem), "left": fmt_left(rem) if snap["active"] else "",
+                "listening": bool(listening)}
+
+    def follow_stop(self) -> dict:
+        self._follow_end("ui", say=False)
+        return {"ok": True}
+
+    def _follow_end(self, reason: str, *, say: bool) -> None:
+        was = self.follow.end(reason)
+        self._sync_listen()
+        live_off = reason == "voice" and bool(self.settings.get("live_mode"))
+        if live_off:
+            self.set_live(False)  # «хватит» also meant «stop commenting» before 1.6 (the model switched live mode off)
+        if not was and not live_off:
+            return
+        log.info("conversation mode: ended (%s)%s", reason, "; live mode off" if live_off else "")
+        beep("stop")
+        if say:
+            code = self._reply_lang()
+            text = FOLLOW_BYE.get(code, FOLLOW_BYE["en"])
+            self.emit("chat", role="jarvis", text=text)
+            if self.settings["speak_replies"]:
+                self.say(text, lang=code)
+        if self.state == "thinking":
+            self.set_state("idle")
+
+    def _on_follow_utterance(self, utt: dict) -> None:
+        """Conversation listener (its own thread): a finished phrase heard without the name."""
+        if not self.follow.active() or self._answering or self._rec is not None or self.speaker.speaking \
+                or self._follow_busy or self.state == "thinking":
+            return
+        self._follow_busy = True
+        self._sync_listen()
+        turn = VoiceTurn("voice")
+        turn.mark("speech_end", utt["t_end"] - max(0.3, self.settings["vad_silence_ms"] / 1000.0))
+        turn.mark("rec_end", utt["t_end"])
+        self._jobs.put(("follow", (turn, utt)))
+
+    def _follow_job(self, turn: VoiceTurn, utt: dict) -> None:
+        s = self.settings
+        code = L.speech_lang(s)
+        from .audio import pcm_to_wav
+        wav = pcm_to_wav(utt["pcm"].tobytes())
+        text, conf, engine = "", 0.0, "vosk"
+        if self._whisper_ready():
+            try:
+                text, conf, lang = stt_whisper.engine().transcribe(wav, lang_mode=s.get("whisper_lang", "pair"),
+                                                                   speech_lang=code, prompt="")
+                engine = "whisper"
+                turn.stt, turn.lang = "whisper", lang or ""
+            except Exception as e:
+                log.warning("follow: whisper failed: %s", e)
+                text = ""
+        if not text and utt.get("text"):
+            text, conf, engine = utt["text"], float(utt.get("conf") or 0.0), "vosk"
+            turn.stt = "local"
+        always = self.follow.always
+        if (not text and engine != "whisper" and not utt.get("text") and not always
+                and float(utt.get("speech_sec") or 0.0) >= 0.6 and not stt_local.model_path(code)):
+            try:  # neither Whisper nor a local model for his language: cloud transcription (timed window only)
+                text = self.brain.transcribe(wav, lang=code)
+                conf, engine, turn.stt = 0.9, "cloud", "cloud"
+            except Exception as e:
+                log.info("follow: cloud transcription failed: %s", type(e).__name__)
+                text = ""
+        text = (text or "").strip()
+        name = persona.assistant_name(s)
+        if text and is_stop_phrase(text, name):
+            self.emit("chat", role="user", text=text)
+            self._follow_end("voice", say=True)
+            return
+        why = junk_reason(text, conf, float(utt.get("speech_sec") or 0.0), engine=engine, always=always)
+        pc_recent = self.pc.recent_texts(25.0) if self.settings.get("pc_hearing") else []
+        if len(pc_recent) > 1:
+            pc_recent.append(" ".join(pc_recent[-3:]))  # a phrase may span two loopback segments
+        if not why and pc_recent and echo_match(text, pc_recent):
+            why = "это звук с ПК"
+        if not why and always and self._last_reply and echo_match(text, [self._last_reply]):
+            why = "эхо моего ответа"
+        if why:
+            # never log what was said in the room: only why it was skipped
+            log.info("follow: skip phrase (%s; %s conf %.2f, %.1f s speech, %d chars)", why, engine, conf,
+                     float(utt.get("speech_sec") or 0.0), len(text))
+            return
+        turn.mark("text")
+        if turn.stt == "whisper":
+            self.user_lang = turn.lang if turn.lang in L.LANGS else L.detect(text, prefer=code)
+        else:
+            self.user_lang = code
+        text = self._clean_voice_text(text, wav, code, local=turn.stt != "whisper")
+        addressed = bool(re.match(rf"^\W*{re.escape(name.lower())}\b", text.lower())) if name else False
+        log.info("follow: phrase without the name (%s, conf %.2f) → model", engine, conf)
+        self._answer(text, voice=True, turn=turn, follow_ok=True,
+                     overheard="" if addressed else ("always" if always else "follow"),
+                     before_output=lambda: self.emit("chat", role="user", text=text))
+
+    # ── v1.6 «Слышать звук ПК» ──
+    def _fg_title(self) -> str:
+        try:
+            fg = get_foreground()
+            if fg.pid == os.getpid():
+                return ""
+            return fg.title or fg.process
+        except Exception:
+            return ""
+
+    def _pc_transcribe(self, wav: bytes) -> tuple[str, float, str]:
+        """Speech from the speakers → text. Whisper only on an NVIDIA GPU that no game needs and only when
+        it is not busy with his own voice; otherwise the small Vosk model on the CPU. Never blocks his turns."""
+        s = self.settings
+        code = L.speech_lang(s)
+        eng = stt_whisper.engine()
+        if (self._whisper_ready() and eng.device == "cuda" and not self.local.blocked()
+                and self._rec is None and not self._follow_busy and not eng._lock.locked()):
+            text, conf, _lang = eng.transcribe(wav, lang_mode="auto", speech_lang=code, prompt="")
+            return (text if conf >= 0.4 else ""), conf, "whisper"
+        for c in dict.fromkeys([code, "ru"]):
+            path = stt_local.model_path(c)
+            if path and stt_local.is_loaded(c):
+                text, conf = stt_local.transcribe_wav(stt_local.get_model(path), wav)
+                return (text if conf >= 0.5 else ""), conf, "vosk"
+        return "", 0.0, "-"
+
+    def pc_hearing_info(self) -> dict:
+        d = self.pc.info()
+        d["enabled"] = bool(self.settings.get("pc_hearing"))
+        return d
 
     # ── focus session ──
     def focus_start(self, task: str, minutes=None, rounds=None) -> dict:
@@ -857,6 +1447,7 @@ class JarvisCore:
                     self._on_phase(ev)
                 self._check_reminders()
                 now = time.monotonic()
+                self._sync_listen()
                 self._guard_step(now)
                 self._live_step(now)
             except Exception:
@@ -1027,6 +1618,9 @@ class JarvisCore:
             system, prompt = build_prompt(s, task=snap["task"], focus_phase=snap["phase"], title=fg.title,
                                           process=fg.process, fullscreen=fullscreen, since_remark=since,
                                           memory=self.live.memory_lines(now), user_lang=self.user_lang)
+            pc = self.pc.context_block() if s.get("pc_hearing") else ""
+            if pc:
+                prompt += "\n\n" + pc
             d = self.brain.live_decide(jpeg, system, prompt)
             del jpeg  # memory only, never saved
             self.live.on_success()

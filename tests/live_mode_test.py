@@ -31,10 +31,10 @@ def screen(kind):
             d.text((60, 60 + i * 30), f"{i+1:>3}  {l}", font=F(20, True), fill=(212, 212, 212))
         d.line([(430, 60 + 11 * 30 + 26), (520, 60 + 11 * 30 + 26)], fill=(240, 60, 60), width=3)
         d.rectangle([0, 640, 1920, 1040], fill=(24, 24, 24)); d.text((12, 648), "TERMINAL   PROBLEMS (1)   OUTPUT", font=F(16), fill=(200, 200, 200))
-        tb = ["PS C:\\Users\\vova\\homework_bot> python bot.py", "Traceback (most recent call last):",
-              '  File "C:\\Users\\vova\\homework_bot\\bot.py", line 12, in <module>',
+        tb = ["PS C:\\Users\\user\\homework_bot> python bot.py", "Traceback (most recent call last):",
+              '  File "C:\\Users\\user\\homework_bot\\bot.py", line 12, in <module>',
               "    print('Среднее:', total / len(score))", "                                  ^^^^^",
-              "NameError: name 'score' is not defined. Did you mean: 'scores'?", "PS C:\\Users\\vova\\homework_bot> "]
+              "NameError: name 'score' is not defined. Did you mean: 'scores'?", "PS C:\\Users\\user\\homework_bot> "]
         for i, l in enumerate(tb):
             d.text((20, 690 + i * 30), l, font=F(20, True), fill=(240, 90, 90) if "Error" in l else (220, 220, 220))
         taskbar(d, "Visual Studio Code"); return img, "bot.py - homework_bot - Visual Studio Code", "Code.exe"

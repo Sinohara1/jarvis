@@ -360,7 +360,9 @@ class VoiceTurn:
     def __init__(self, source: str = "voice") -> None:
         self.source = source
         self.t: dict[str, float] = {}
-        self.stt = ""          # "local" | "cloud" | "wake-local"
+        self.stt = ""          # "local" | "cloud" | "wake-local" | "whisper"
+        self.lang = ""         # language detected by the recogniser (Whisper), "" = unknown
+        self.fallback = ""     # Vosk text kept in case the Whisper pass fails (engine = whisper)
         self.model = ""
         self.cancelled = False
         self.reported = False

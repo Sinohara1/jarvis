@@ -128,6 +128,18 @@ def run() -> int:
     def ai():
         return Brain(lambda: s, None).test_connection(s.get("provider", "gemini"))
 
+    def ollama_check():
+        # v1.5 local model: report only (no model load here — the GPU may be busy with a game)
+        from .local_ai import OllamaManager, find_exe, DEFAULT_URL
+        m = OllamaManager((s.get("base_urls") or {}).get("ollama") or DEFAULT_URL)
+        want = ((s.get("models") or {}).get("ollama") or {}).get("chat") or ""
+        if not m.running():
+            return f"not running (exe: {find_exe() or 'not installed'}); route={s.get('ai_route')}"
+        names = [x["name"] for x in m.models()]
+        ld = m.loaded()
+        return (f"ollama {m.version}, route={s.get('ai_route')}, model={want or 'default'}, "
+                f"downloaded={names}, loaded={[(x['name'], x['vram_gb'], x['gpu']) for x in ld]}")
+
     step("piper", piper_check)
     step("vad", vad_check)
     step("stt", stt_check)
@@ -135,6 +147,7 @@ def run() -> int:
     step("wakeword", wake)
     step("mic", mic)
     step("vosk", vosk_check)
+    step("ollama", ollama_check, optional=True)
     step("ai-stream", ai_stream, optional=True)
     step("ai", ai, optional=True)  # chat model; the free tier is often exhausted (429) — not a build problem
     log.info("selftest done: %d failure(s)", fails)

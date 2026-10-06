@@ -1,8 +1,10 @@
 """PC actions exposed to the model via function calling.
 
-Only non-destructive actions: open apps / URLs / files, search, find files,
-focus-session control, reminders, time, a look at the screen. Nothing deletes,
-closes or sends anything.
+Open apps / URLs / files, search, media keys, focus, reminders, screen look.
+At pc_control=full: desktop control (windows, type/hotkeys, shell with consent),
+Telegram Desktop send, elevated scripts (UAC), lock/sleep/monitor off.
+Hard limits: no silent UAC bypass, no mass-delete/disk wipe, soft window close only.
+Tool list is filtered by settings.pc_control (safe | standard | full).
 """
 
 from __future__ import annotations
@@ -33,10 +35,16 @@ TOOLS: list[dict] = [
     {
         "name": "open_app",
         "description": "Открыть приложение на компьютере пользователя (ищет в меню Пуск, на рабочем столе и среди встроенных программ). "
-                       "Передавай официальное название программы, обычно латиницей (Telegram, Google Chrome, Visual Studio Code, Spotify, Discord, Steam, Word, Excel), "
-                       "или системное (калькулятор, блокнот, проводник, параметры, диспетчер задач).",
+                       "Вызывай сразу на «открой …», «запусти …» — не отвечай только текстом «открываю». "
+                       "Для музыки («включи музыку», «включи спотик», «включи <трек> в спотике», пауза, следующий) — media_control "
+                       "(с query для конкретного трека), не open_app. "
+                       "Открыть что-то ВНУТРИ приложения (чат, избранное, поиск, файл в редакторе) — telegram_open_chat / app_search "
+                       "(«полный»), одного open_app мало. Написать в Telegram — send_telegram. "
+                       "Закрыть/свернуть окно — window_control; ввести текст — type_text (оба при «полном»). "
+                       "Передавай официальное название латиницей: Telegram (на «открой телеграм»/«открой тг»), Spotify, Discord, Steam, "
+                       "Google Chrome, Visual Studio Code, Word, Excel; системные: калькулятор, блокнот, проводник, параметры, диспетчер задач.",
         "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "Название приложения"}},
+            "name": {"type": "string", "description": "Название приложения (Telegram, Spotify, калькулятор, …)"}},
             "required": ["name"]},
     },
     {
@@ -128,6 +136,169 @@ TOOLS: list[dict] = [
             "enabled": {"type": "boolean", "description": "true — включить, false — выключить"}},
             "required": ["enabled"]},
     },
+
+    {
+        "name": "media_control",
+        "description": "Музыка и медиа: play / pause / next / previous, а также НАЙТИ И ВКЛЮЧИТЬ конкретный трек в Spotify. "
+                       "«Включи Can't Fault Das в спотике», «play Numb by Linkin Park on Spotify», «поставь Кино Группа крови» → "
+                       "action=\"play\", app=\"spotify\", query=\"<название трека и/или исполнителя>\" — Jarvis сам откроет Spotify, "
+                       "найдёт и запустит первый результат. Не отказывайся «не могу выбрать песню» — просто вызови с query. "
+                       "query — только название/исполнитель (без «включи», «в спотике»), английские названия пиши латиницей как в оригинале. "
+                       "«Включи музыку» / «включи спотик» без названия, «пауза», «следующий трек», «предыдущий» — без query "
+                       "(медиаклавиши; app=\"spotify\" откроет Spotify). Не используй open_app для музыки. "
+                       "Кнопка play/«нажми плей»/«продолжи видео»/«сними с паузы» в любом плеере (YouTube, VLC, браузер, "
+                       "Spotify) → action=\"play\" (или press_hotkey \"space\"/\"enter\" в окне плеера). "
+                       "Это реальное нажатие медиаклавиши — не рассказывай про ограничения, просто вызови.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["play", "pause", "play_pause", "next", "previous"],
+                       "description": "play — включить (с query — найти и включить трек); pause/play_pause — пауза; next/previous — трек"},
+            "app": {"type": "string", "description": "spotify (по умолчанию для query) или пусто — системные медиаклавиши"},
+            "query": {"type": "string", "description": "Что найти и включить: название трека, исполнитель, альбом или плейлист, "
+                                                       "например «Can't Fault Das» или «Linkin Park Numb»"}},
+            "required": ["action"]},
+    },
+    {
+        "name": "adjust_volume",
+        "description": "Системная громкость: громче / тише / вкл-выкл звук (медиаклавиши Volume).",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["up", "down", "mute"]}},
+            "required": ["action"]},
+    },
+    {
+        "name": "send_telegram",
+        "description": "Написать и отправить сообщение в Telegram Desktop от имени пользователя (не бот). "
+                       "«напиши в телеграм …», «отправь в тг Маме: …», «запиши себе в избранное …» (contact=\"Избранное\"), "
+                       "«Write Mom on Telegram, I'm home» (contact=\"Mom\", message=\"I'm home\"). "
+                       "Нужен уровень управления ПК «полный». Сам открывает Telegram и нужный чат — не вызывай перед ним "
+                       "open_app/type_text/press_hotkey. "
+                       "Best-effort: Telegram Desktop должен быть установлен и залогинен; поиск чата может промахнуться — "
+                       "предупреди пользователя проверить. contact — имя чата как в списке чатов, в именительном падеже "
+                       "(«Мама», не «Маме»), @username или «Избранное»; message — текст.",
+        "parameters": {"type": "object", "properties": {
+            "contact": {"type": "string", "description": "Имя чата, контакта или @username"},
+            "message": {"type": "string", "description": "Текст сообщения"}},
+            "required": ["contact", "message"]},
+    },
+    {
+        "name": "telegram_open_chat",
+        "description": "Открыть конкретный чат в Telegram Desktop (без отправки): «открой избранное в телеграме», "
+                       "«open Saved Messages on Telegram», «открой чат с Мамой», «перейди в тг к @durov». "
+                       "Также после «открой телеграм» на «зайди в чат с …» / «найди ник …» — этот инструмент, не type_text/press_hotkey. "
+                       "Saved Messages/Избранное → Ctrl+0; @username → tg://resolve; иначе Esc → Ctrl+F (поиск по чатам) → ввод → Enter "
+                       "на первом результате (Ctrl+K в Telegram — это вставка ссылки, не поиск). "
+                       "Нужен «полный». Ты МОЖЕШЬ открывать чаты пользователя — это его собственный Telegram, не отказывайся "
+                       "и не говори про приватность или ограничения.",
+        "parameters": {"type": "object", "properties": {
+            "chat": {"type": "string", "description": "«Избранное» / «Saved Messages», @username (ник) или имя чата как в "
+                                                      "списке чатов, в именительном падеже («Мама», не «Мамой»)"}},
+            "required": ["chat"]},
+    },
+    {
+        "name": "app_search",
+        "description": "Универсально: открыть/сфокусировать любое приложение и найти/открыть что-то ВНУТРИ него — "
+                       "фокус окна → горячая клавиша поиска → вставка запроса → Enter → (опц.) доп. клавиши. Нужен «полный». "
+                       "Примеры: найти сервер/канал в Discord, файл в VS Code (ctrl+p), чат в WhatsApp, сайт в адресной строке "
+                       "Chrome/Edge, папку в Проводнике, страницу в Notion, игру в Steam. Знает хоткеи Spotify, Telegram, Discord, "
+                       "браузеров, VS Code, Проводника, Slack, Notion, Obsidian, WhatsApp, Steam; для других передай search_keys. "
+                       "Для музыки лучше media_control(query), для чатов Telegram — telegram_open_chat. "
+                       "При «полном» не отказывайся «не могу зайти в приложение» — используй этот инструмент "
+                       "(или window_control + press_hotkey + type_text по шагам).",
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string", "description": "Приложение или часть заголовка окна (Discord, Chrome, VS Code, Steam…); "
+                                                     "пусто — активное окно"},
+            "query": {"type": "string", "description": "Что ввести в поиск"},
+            "search_keys": {"type": "string", "description": "Опционально: клавиши открытия поиска, шаги через «;» "
+                                                             "(ctrl+f, ctrl+k, esc; ctrl+f). По умолчанию — из пресета приложения "
+                                                             "или ctrl+f. Для Telegram не передавай (там свой сценарий)"},
+            "then_keys": {"type": "string", "description": "Опционально: клавиши после Enter для навигации по результатам, "
+                                                           "например «down; enter» или «tab*3; enter»"},
+            "press_enter": {"type": "boolean", "description": "Нажать Enter после ввода (по умолчанию true)"}},
+            "required": ["query"]},
+    },
+    {
+        "name": "run_elevated",
+        "description": "Запустить скрипт (.ps1 / .bat / .cmd / .py) с запросом прав администратора (окно UAC). "
+                       "Только при уровне управления ПК «полный». Путь — существующий файл в папке пользователя (или OneDrive). "
+                       "Никакого обхода UAC: пользователь должен подтвердить сам.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Полный путь к скрипту"},
+            "args": {"type": "string", "description": "Опциональные аргументы командной строки"}},
+            "required": ["path"]},
+    },
+    {
+        "name": "window_control",
+        "description": "Управление окном Windows: close / focus / minimize / maximize / restore. "
+                       "Нужен уровень «полный». name — часть заголовка окна (пусто = активное). "
+                       "close мягко шлёт WM_CLOSE (приложение может спросить про сохранение); принудительный kill процесса нет — "
+                       "мягкое закрытие разрешено, делай без лишних вопросов. "
+                       "«закрой хром», «сверни телеграм», «разверни спотифай», «переключись на код». "
+                       "Окна ищутся и по процессу (Spotify, Telegram и др. — даже если заголовок «Исполнитель - Трек»).",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["close", "focus", "minimize", "maximize", "restore"]},
+            "name": {"type": "string", "description": "Часть заголовка окна; пусто — активное окно"}},
+            "required": ["action"]},
+    },
+    {
+        "name": "type_text",
+        "description": "Ввести (вставить) текст в активное или указанное окно через буфер обмена. "
+                       "Нужен «полный». «напиши в блокноте …», «введи пароль …» (не логируется). "
+                       "Для отправки в Telegram лучше send_telegram. press_enter — нажать Enter после вставки. "
+                       "Не отвечай «не могу вводить текст» — вызывай.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Текст для вставки"},
+            "window": {"type": "string", "description": "Часть заголовка окна; пусто — активное"},
+            "press_enter": {"type": "boolean", "description": "Нажать Enter после вставки"}},
+            "required": ["text"]},
+    },
+    {
+        "name": "press_hotkey",
+        "description": "Нажать комбинацию или последовательность клавиш в активном или указанном окне. Нужен «полный». "
+                       "Примеры: ctrl+c, ctrl+v, ctrl+z, alt+f4, alt+tab, win+d, win+l, ctrl+shift+esc, f5; "
+                       "последовательность шагами через «;» и повтор *N: «esc; ctrl+f», «down*3; enter», «tab; space». "
+                       "Вместе с type_text и window_control позволяет управлять любым приложением по шагам. "
+                       "Нажать кнопку на экране: play/воспроизведение → \"space\" (или \"enter\", \"k\" в YouTube) в окне плеера "
+                       "либо media_control; кнопку в фокусе → \"enter\"/\"space\"; перейти к кнопке → \"tab*N; enter\". "
+                       "Это настоящие нажатия клавиш: не говори «не могу нажать/кликнуть» — вызывай. "
+                       "Ctrl+Alt+Del эмулировать нельзя.",
+        "parameters": {"type": "object", "properties": {
+            "keys": {"type": "string", "description": "Комбинация (ctrl+s, alt+f4) или шаги через «;» (esc; ctrl+f; down*2; enter)"},
+            "window": {"type": "string", "description": "Часть заголовка окна; пусто — активное"}},
+            "required": ["keys"]},
+    },
+    {
+        "name": "run_command",
+        "description": "Выполнить команду в cmd или PowerShell от имени пользователя (без повышения прав). "
+                       "Нужен «полный». Опасные команды (удаление, taskkill, shutdown, reg delete…) требуют "
+                       "сначала спросить пользователя и вызвать снова с confirm=true. "
+                       "Массовое удаление / format / diskpart — всегда отказ. Для admin-скриптов — run_elevated.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "Текст команды"},
+            "shell": {"type": "string", "enum": ["cmd", "powershell"], "description": "Оболочка (по умолчанию cmd)"},
+            "confirm": {"type": "boolean", "description": "true только после явного согласия на опасную команду"},
+            "timeout": {"type": "number", "description": "Таймаут секунд (1–120, по умолчанию 30)"}},
+            "required": ["command"]},
+    },
+    {
+        "name": "get_active_window",
+        "description": "Узнать заголовок и процесс активного окна; опционально список видимых окон. "
+                       "Нужен «полный». Полезно перед window_control / type_text.",
+        "parameters": {"type": "object", "properties": {
+            "list_windows": {"type": "boolean", "description": "true — добавить до 25 видимых окон"}},
+            "required": []},
+    },
+    {
+        "name": "lock_workstation",
+        "description": "Заблокировать компьютер (как Win+L). Нужен уровень «полный».",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "system_power",
+        "description": "Сон ПК (sleep) или погасить монитор (monitor_off). Нужен «полный». "
+                       "Выключение/перезагрузка этим инструментом не делаются. Чётко предупреди пользователя перед сном.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["sleep", "monitor_off"]}},
+            "required": ["action"]},
+    },
     {
         "name": "look_at_screen",
         "description": "Посмотреть на экран пользователя (скриншот активного монитора) и ответить на вопрос о том, что там видно.",
@@ -136,6 +307,25 @@ TOOLS: list[dict] = [
             "required": ["question"]},
     },
 ]
+
+
+# ─── PC control gating (re-export from pc_power) ──────────────────────────────
+
+from .pc_power import (  # noqa: E402
+    PC_CONTROL_RANKS, TOOL_MIN_LEVEL, SPOTIFY_ALIASES,
+    pc_control_level, tool_allowed, resolve_media_action, resolve_volume_action,
+    send_media_key, MEDIA_ACTION_VK, VOLUME_ACTION_VK,
+    send_telegram_desktop, run_elevated_script, open_spotify_protocol,
+    telegram_open_chat, app_search,
+    window_action, type_text_into, press_hotkey, run_shell_command,
+    get_foreground_info, list_visible_windows, lock_workstation, system_power_action,
+)
+
+
+def tools_for_settings(settings: dict | None = None) -> list[dict]:
+    lvl = pc_control_level(settings)
+    return [t for t in TOOLS if tool_allowed(t["name"], lvl)]
+
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -159,13 +349,21 @@ APP_ALIASES = {
     "хром": "google chrome", "гугл хром": "google chrome", "chrome": "google chrome",
     "ворд": "word", "эксель": "excel", "поверпоинт": "powerpoint", "павер поинт": "powerpoint",
     "вскод": "visual studio code", "vs code": "visual studio code", "vscode": "visual studio code",
-    "телега": "telegram", "телеграм": "telegram", "телеграмм": "telegram",
+    "телега": "telegram", "телеграм": "telegram", "телеграмм": "telegram", "тг": "telegram",
     "дискорд": "discord", "стим": "steam", "спотифай": "spotify", "обс": "obs studio",
     "яндекс браузер": "yandex", "яндекс": "yandex", "фаерфокс": "firefox", "файрфокс": "firefox",
     "эдж": "microsoft edge", "edge": "microsoft edge", "опера": "opera", "ватсап": "whatsapp",
     "зум": "zoom", "ноушен": "notion", "обсидиан": "obsidian",
     "майнкрафт": "minecraft launcher", "брейв": "brave", "фотошоп": "photoshop",
 }
+
+# Voice / Vosk mangled English brand names (shared table with stt_normalize).
+try:
+    from .stt_normalize import brand_alias_targets
+    for _alias, _target in brand_alias_targets().items():
+        APP_ALIASES.setdefault(_alias, _target)
+except Exception:  # pragma: no cover — circular import during partial load
+    pass
 
 
 def translit(s: str) -> str:
@@ -364,10 +562,23 @@ class Actions:
         except Exception:
             log.exception("app index build failed")
 
+    def _settings(self) -> dict:
+        try:
+            return self.core.settings or {}
+        except Exception:
+            return {}
+
     def execute(self, name: str, args: dict) -> dict:
         fn = getattr(self, f"do_{name}", None)
         if fn is None:
             return {"ok": False, "error": f"неизвестное действие {name}"}
+        if not tool_allowed(name, settings=self._settings()):
+            lvl = pc_control_level(self._settings())
+            need = TOOL_MIN_LEVEL.get(name, "safe")
+            return {"ok": False, "error": (
+                f"действие «{name}» недоступно при уровне управления ПК «{lvl}» "
+                f"(нужен «{need}» или выше). Смени в настройках ИИ → Управление компьютером."
+            )}
         try:
             res = fn(**(args or {}))
         except TypeError as e:
@@ -375,7 +586,38 @@ class Actions:
         except Exception as e:
             log.exception("action %s failed", name)
             res = {"ok": False, "error": str(e)[:200]}
-        log.info("action %s(%s) -> %s", name, _short(args), _short(res))
+        # Never log Telegram / typed text / full shell command bodies at INFO
+        if name == "send_telegram":
+            safe_args = {"contact": (args or {}).get("contact"),
+                         "message_len": len(str((args or {}).get("message") or ""))}
+            safe_res = {k: v for k, v in (res or {}).items() if k != "message"} if isinstance(res, dict) else res
+            log.info("action %s(%s) -> %s", name, _short(safe_args), _short(safe_res))
+        elif name == "type_text":
+            safe_args = {"text_len": len(str((args or {}).get("text") or "")),
+                         "window": (args or {}).get("window"),
+                         "press_enter": (args or {}).get("press_enter")}
+            log.info("action %s(%s) -> %s", name, _short(safe_args), _short(res))
+        elif name in ("app_search", "telegram_open_chat"):
+            a = args or {}
+            safe_args = {k: v for k, v in a.items() if k not in ("query", "chat", "contact")}
+            safe_args["text_len"] = len(str(a.get("query") or a.get("chat") or a.get("contact") or ""))
+            log.info("action %s(%s) -> %s", name, _short(safe_args), _short(res))
+        elif name in ("remember_fact", "forget_fact", "recall_memory"):
+            # personal facts never reach the log: only lengths / ids / counts
+            a = args or {}
+            safe_args = {"text_len": len(str(a.get("text") or a.get("query") or ""))}
+            if a.get("category"):
+                safe_args["category"] = a.get("category")
+            safe_res = {k: v for k, v in res.items() if k in ("ok", "id", "category", "updated", "count", "evicted")} \
+                if isinstance(res, dict) else res
+            log.info("action %s(%s) -> %s", name, _short(safe_args), _short(safe_res))
+        elif name == "run_command":
+            cmd = str((args or {}).get("command") or "")
+            safe_args = {"command_len": len(cmd), "command_preview": cmd[:80],
+                         "shell": (args or {}).get("shell"), "confirm": (args or {}).get("confirm")}
+            log.info("action %s(%s) -> %s", name, _short(safe_args), _short(res))
+        else:
+            log.info("action %s(%s) -> %s", name, _short(args), _short(res))
         return res
 
     # apps / web / files
@@ -384,6 +626,11 @@ class Actions:
         q = (name or "").strip()
         if not q:
             return None
+        try:
+            from .stt_normalize import canonical_app_name
+            q = canonical_app_name(q)
+        except Exception:
+            pass
         alias = APP_ALIASES.get(q.lower()) or APP_ALIASES.get(norm(q))
         if alias and (alias.endswith(".exe") or alias.endswith(":")):
             return ("exe", q, alias)
@@ -515,8 +762,153 @@ class Actions:
     def do_set_live_mode(self, enabled: bool = True) -> dict:
         return self.core.set_live(bool(enabled))
 
+
+    def do_media_control(self, action: str = "play", app: str = "", query: str = "", track: str = "",
+                         **_extra) -> dict:
+        act = resolve_media_action(action or "play")
+        q = (query or track or "").strip()
+        app_l = (app or "").strip().lower()
+        want_spotify = app_l in SPOTIFY_ALIASES or "spotify" in app_l or "спот" in app_l
+        if q and (act in (None, "play", "play_pause") or not act) and (want_spotify or not app_l):
+            # «включи <трек> в спотике» → search + play the track, not just the media key.
+            from .spotify import play_query
+            return play_query(q, ensure_open=lambda n: self.do_open_app(n), settings=self._settings())
+        if not act:
+            return {"ok": False, "error": "неизвестное медиа-действие", "hint": "play/pause/next/previous"}
+        opened = False
+        if want_spotify or act == "play":
+            # For plain «play» without app, still try media key; for Spotify ensure app is up.
+            if want_spotify:
+                from .pc_power import find_window_by_process
+                running = bool(find_window_by_process(["spotify.exe"]))
+                if running:
+                    pass
+                elif open_spotify_protocol():
+                    opened = True
+                    time.sleep(1.5)
+                else:
+                    r = self.do_open_app("Spotify")
+                    opened = bool(r.get("ok"))
+                    if opened:
+                        time.sleep(1.5)
+                    elif act == "play":
+                        return {"ok": False, "error": "Spotify не найден — установи или открой вручную",
+                                "detail": r}
+        vk = MEDIA_ACTION_VK.get(act)
+        if vk is None:
+            return {"ok": False, "error": f"нет клавиши для {act}"}
+        if not send_media_key(vk):
+            if not IS_WIN:
+                return {"ok": False, "error": "медиаклавиши доступны только в Windows"}
+            return {"ok": False, "error": "не удалось отправить медиаклавишу"}
+        out = {"ok": True, "action": act, "key_sent": True}
+        if want_spotify:
+            out["app"] = "Spotify"
+            out["opened"] = opened
+        return out
+
+    def do_adjust_volume(self, action: str) -> dict:
+        act = resolve_volume_action(action)
+        if not act:
+            return {"ok": False, "error": "укажи up, down или mute"}
+        vk = VOLUME_ACTION_VK[act]
+        if not send_media_key(vk):
+            if not IS_WIN:
+                return {"ok": False, "error": "громкость через медиаклавиши — только Windows"}
+            return {"ok": False, "error": "не удалось изменить громкость"}
+        return {"ok": True, "action": act}
+
+    def _tg_contact(self, name: str) -> str:
+        """«voice_contacts» alias («Мама=@mama_tg») / listed spelling of a declined name («Мамой» → «Мама»)."""
+        try:
+            from .stt_commands import resolve_contact
+            return resolve_contact(name, self._settings())
+        except Exception:
+            return (name or "").strip()
+
+    def do_send_telegram(self, contact: str = "", message: str = "", chat: str = "", text: str = "",
+                         **_extra) -> dict:
+        return send_telegram_desktop(self._tg_contact(contact or chat), message or text,
+                                     ensure_open=lambda n: self.do_open_app(n))
+
+    def do_telegram_open_chat(self, chat: str = "", contact: str = "", query: str = "", **_extra) -> dict:
+        return telegram_open_chat(self._tg_contact(chat or contact or query), ensure_open=lambda n: self.do_open_app(n))
+
+    def do_app_search(self, query: str, app: str = "", search_keys: str = "", then_keys: str = "",
+                      press_enter: bool = True, **_extra) -> dict:
+        a = (app or "").strip()
+        rl = a.lower()
+        if a and (rl in SPOTIFY_ALIASES or "spotify" in rl or "спот" in rl) and press_enter is not False \
+                and not (search_keys or then_keys):
+            from .spotify import play_query  # Spotify search+Enter == play; reuse the verified path
+            return play_query(query, ensure_open=lambda n: self.do_open_app(n), settings=self._settings())
+        if a and ("telegram" in rl or "телег" in rl or rl in ("тг", "tg")) and press_enter is not False:
+            # Always the dedicated flow: focus → Esc → Ctrl+F → paste → Enter. Models pass search_keys
+            # «ctrl+k» (Discord habit) which in Telegram Desktop inserts a link instead of searching.
+            r = telegram_open_chat(self._tg_contact(query), ensure_open=lambda n: self.do_open_app(n))
+            if (search_keys or then_keys) and isinstance(r, dict):
+                r.setdefault("note", "")
+                r["note"] = (r["note"] + " search_keys/then_keys для Telegram игнорируются — свой надёжный сценарий.").strip()
+            return r
+        return app_search(a, query, ensure_open=lambda n: self.do_open_app(n), search_keys=search_keys or "",
+                          then_keys=then_keys or "", press_enter=press_enter is not False)
+
+    def do_run_elevated(self, path: str, args: str = "") -> dict:
+        return run_elevated_script(path, args or "")
+
+    def do_window_control(self, action: str, name: str = "") -> dict:
+        return window_action(action, name or "")
+
+    def do_type_text(self, text: str, window: str = "", press_enter: bool = False) -> dict:
+        return type_text_into(text, window or "", press_enter=bool(press_enter))
+
+    def do_press_hotkey(self, keys: str, window: str = "") -> dict:
+        return press_hotkey(keys, window or "")
+
+    def do_run_command(self, command: str, shell: str = "cmd", confirm: bool = False,
+                       timeout: float = 30.0) -> dict:
+        return run_shell_command(command, shell=shell or "cmd", confirm=bool(confirm),
+                                 timeout=float(timeout or 30))
+
+    def do_get_active_window(self, list_windows: bool = False) -> dict:
+        info = get_foreground_info()
+        if list_windows and info.get("ok"):
+            info["windows"] = list_visible_windows(25)
+        return info
+
+    def do_lock_workstation(self) -> dict:
+        return lock_workstation()
+
+    def do_system_power(self, action: str) -> dict:
+        return system_power_action(action)
+
     def do_look_at_screen(self, question: str = "Что на экране?") -> dict:
         return self.core.look_at_screen(question)
+
+    # companion memory (memory.py); schemas are added by Brain.tool_list only while memory is on
+    def _memory(self):
+        mem = getattr(self.core, "memory", None)
+        if mem is None or not mem.enabled:
+            return None
+        return mem
+
+    def do_remember_fact(self, text: str = "", category: str = "", fact: str = "", **_extra) -> dict:
+        mem = self._memory()
+        if mem is None:
+            return {"ok": False, "error": "долгая память выключена (ИИ → Память)"}
+        return mem.add(text or fact, category or None, source="model")
+
+    def do_forget_fact(self, query: str = "", text: str = "", id: str = "", **_extra) -> dict:
+        mem = self._memory()
+        if mem is None:
+            return {"ok": False, "error": "долгая память выключена (ИИ → Память)"}
+        return mem.forget(id or query or text)
+
+    def do_recall_memory(self, query: str = "", **_extra) -> dict:
+        mem = self._memory()
+        if mem is None:
+            return {"ok": False, "error": "долгая память выключена (ИИ → Память)"}
+        return mem.recall(query or "")
 
 
 def time_info(now: datetime | None = None) -> dict:

@@ -1,4 +1,4 @@
-"""Version manager over public GitHub Releases (Sinohara1/jarvis-releases — exe only, code is private).
+"""Version manager over public GitHub Releases of Sinohara1/jarvis (open source; Jarvis.exe is a release asset).
 
 No token needed (unauthenticated public API, 60 requests/hour per IP). Every
 release that has a Jarvis.exe asset can be installed: newer (update) or older
@@ -26,7 +26,7 @@ from . import APP_VERSION
 
 log = logging.getLogger("jarvis")
 
-UPDATE_REPO = "Sinohara1/jarvis-releases"
+UPDATE_REPO = "Sinohara1/jarvis"
 UPDATE_ASSET_NAME = "Jarvis.exe"
 GH_API = "https://api.github.com"
 GH_UA = f"Jarvis/{APP_VERSION}"

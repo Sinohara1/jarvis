@@ -46,6 +46,7 @@ class Foreground:
     process: str = ""
     pid: int = 0
     hwnd: int = 0
+    path: str = ""   # full image path (game detection: …\steamapps\common\…)
 
 
 def get_foreground() -> Foreground:
@@ -61,16 +62,18 @@ def get_foreground() -> Foreground:
         pid = wintypes.DWORD(0)
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         proc = ""
+        full = ""
         h = _kernel32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
         if h:
             try:
                 size = wintypes.DWORD(1024)
                 pbuf = ctypes.create_unicode_buffer(1024)
                 if _kernel32.QueryFullProcessImageNameW(h, 0, pbuf, ctypes.byref(size)):
-                    proc = os.path.basename(pbuf.value)
+                    full = pbuf.value
+                    proc = os.path.basename(full)
             finally:
                 _kernel32.CloseHandle(h)
-        return Foreground(title=buf.value, process=proc, pid=int(pid.value), hwnd=int(hwnd))
+        return Foreground(title=buf.value, process=proc, pid=int(pid.value), hwnd=int(hwnd), path=full)
     except Exception:
         return Foreground()
 

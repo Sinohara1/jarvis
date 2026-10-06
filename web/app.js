@@ -14,7 +14,9 @@ function pvLabel(key) { const v = ((S.tts || {}).voices || []).find((x) => x.key
 const mb = (b) => (b / 1048576).toFixed(0);
 const S = { settings: {}, providers: {}, voices: [], chat: [], focus: {}, stats: {}, state: 'idle', tab: 'home',
             chatMode: false, attach: false, wake: { enabled: false, mode: 'off' }, echo: [], hotkey: 'Ctrl+Alt+J',
-            live: { enabled: false, status: '' }, wakeDl: null, tts: { voices: [] }, ttsDl: null, liteModel: '' };
+            live: { enabled: false, status: '' }, wakeDl: null, tts: { voices: [] }, ttsDl: null, liteModel: '',
+            follow: { active: false }, pcHearing: {} };
+const FOLLOW_MODES = [['off', 'Выкл'], ['30s', '30 с'], ['2m', '2 мин'], ['10m', '10 мин'], ['always', 'Всегда']];
 const TALK = [['rare', 'Редко'], ['some', 'Иногда'], ['often', 'Часто']];
 const WAKE_MODES = [['name', 'По имени'], ['hey_jarvis', 'Hey Jarvis'], ['off', 'Выкл']];
 
@@ -29,7 +31,7 @@ const QUICK = [
   ['monitor', 'Что у меня на экране?', 'Что у меня на экране?'],
   ['bell', 'Таймер на 10 минут', 'Поставь таймер на 10 минут'],
   ['clock', 'Сколько времени?', 'Сколько сейчас времени?'],
-  ['chart', 'Как мой фокус сегодня?', 'Сколько я сегодня был в фокусе?'],
+  ['chart', 'Сколько на счетах?', 'Сколько денег на счетах?'],
   ['stop', 'Остановить фокус', 'Останови фокус-сессию'],
 ];
 
@@ -61,15 +63,18 @@ function connect() {
 
 async function start() {
   const d = await API.init();
+  S.local = d.local || {};
   Object.assign(S, { settings: d.settings, providers: d.providers, voices: d.voices, abilities: d.abilities, tools: d.tools,
                      chat: d.chat || [], focus: d.focus, stats: d.stats, version: d.version, hotkey: d.hotkey,
                      autostart: d.autostart, wake: d.wake, hasKey: d.has_key, dataDir: d.data_dir, presets: d.presets || [],
-                     live: d.live || { enabled: false, status: '' }, tts: d.tts || { voices: [] }, liteModel: d.lite_model || '' });
+                     live: d.live || { enabled: false, status: '' }, tts: d.tts || { voices: [] }, liteModel: d.lite_model || '',
+                     memory: d.memory || { facts: [] }, follow: d.follow || { active: false }, pcHearing: d.pc_hearing || {} });
   applyName();
   setState(d.state || 'idle');
   setMax(d.maximized);
   renderComposer();
   renderGreeting();
+  renderFollow();
   buildPages();
   if (!d.has_key) toast('Нет API-ключа — добавь его во вкладке «Модель».', 'err', 7000);
 }
@@ -106,6 +111,12 @@ function onEvent(e, d) {
       break; }
     case 'tts_dl': S.ttsDl = d; renderTtsStatus(); break;
     case 'stt_dl': S.sttDl = d; renderTtsStatus(); break;
+    case 'whisper': { const w = (S.tts || {}).whisper || {}; const was = w.downloading; S.tts = Object.assign(S.tts || {}, { whisper: d });
+      if (!d.downloading) S.whisperDl = null;
+      if (was && !d.downloading) { if (d.error) toast('Whisper: ' + d.error, 'err', 7000); else toast('Модель Whisper скачана', '', 2600); if (S.tab === 'voice') buildVoice(); else renderWhisperStatus(); }
+      else renderWhisperStatus();
+      break; }
+    case 'whisper_dl': S.whisperDl = d; renderWhisperStatus(); break;
     case 'voice_timing': S.tts.timing = d; renderTtsStatus(); break;
     case 'tool': addMsg({ role: 'tool', text: d.label }); break;
     case 'focus': case 'tick': if (d.focus) { S.focus = d.focus; renderFocusLive(); } break;
@@ -120,7 +131,12 @@ function onEvent(e, d) {
     case 'upd_progress': renderUpdProgress(d); break;
     case 'upd_ready': toast(`Устанавливаю ${d.tag} — ${NM()} перезапустится…`, '', 0); closeModal(); break;
     case 'upd_error': S.installing = null; toast('Не удалось установить: ' + d.error, 'err', 8000); renderVersions(); break;
+    case 'local': S.local = d; renderLocalStatus(); renderComposer(); break;
+    case 'local_pull': S.localPull = d; if (d.status === 'success') { toast(`Модель ${d.model} скачана`, '', 2600); S.localPull = null; API.local_info(true).then((l) => { S.local = l; if (S.tab === 'model') buildModel(); }); } else if (d.status === 'error') { toast('Не удалось скачать модель: ' + (d.error || ''), 'err', 7000); S.localPull = null; } renderLocalStatus(); break;
     case 'reminders': break;
+    case 'memory': if (typeof onMemoryEvent === 'function') onMemoryEvent(d); break;
+    case 'follow': S.follow = d; renderFollow(); break;
+    case 'pc_hearing': S.pcHearing = Object.assign(S.pcHearing || {}, d); renderPcStatus(); break;
   }
 }
 
@@ -223,6 +239,8 @@ async function send(text, opts = {}) {
 // ───────────────────────── composer ─────────────────────────
 function modelLabel() {
   const s = S.settings; const p = s.provider; const m = (s.models && s.models[p] && s.models[p].chat) || '';
+  const L = S.local || {};
+  if (s.ai_route !== 'cloud' && L.model_ok && !(L.game && L.gpu_free)) return localModel() + ' · локально';
   return m || p;
 }
 function watchLabel() {
@@ -304,13 +322,21 @@ function popPlus(anchor) {
   });
 }
 function popModel(anchor) {
-  let h = '';
-  for (const [p, info] of Object.entries(S.providers)) {
-    h += `<div class="ph-h">${esc(info.label)}</div>`;
+  let h = '<div class="ph-h">На этом компьютере</div>';
+  const L = S.local || {};
+  for (const m of localModels().filter((x) => x.installed)) {
+    const sel = S.settings.ai_route !== 'cloud' && m.name === localModel();
+    h += `<button class="pi ${sel ? 'sel' : ''}" data-v="${esc('ollama|' + m.name)}"><span>${esc(m.name)}</span><span class="sub">${esc(m.sub)}</span>${icon('check', 14, 'chk')}</button>`;
+  }
+  if (!localModels().some((x) => x.installed)) h += pi('cfg', 'download', L.installed ? 'Скачать локальную модель…' : 'Установить локальную модель…', '', 'dim');
+  for (const [p, info] of Object.entries(S.providers).filter(([, v]) => !v.local)) {
+    if (p !== S.settings.provider && !(S.settings.api_keys || {})[p] && !info.chat_models.length) continue;
     const cur = S.settings.models[p].chat;
-    const list = Array.from(new Set([cur, ...info.chat_models])).slice(0, 6);
+    const list = Array.from(new Set([cur, ...info.chat_models])).filter(Boolean).slice(0, 6);
+    if (!list.length) continue;
+    h += `<div class="ph-h">${esc(info.label)}</div>`;
     for (const m of list) {
-      const sel = S.settings.provider === p && cur === m;
+      const sel = S.settings.ai_route === 'cloud' && S.settings.provider === p && cur === m;
       h += `<button class="pi ${sel ? 'sel' : ''}" data-v="${esc(p + '|' + m)}"><span>${esc(m)}</span>${icon('check', 14, 'chk')}</button>`;
     }
   }
@@ -318,8 +344,9 @@ function popModel(anchor) {
   openPop(anchor, h, S.chatMode ? 'above' : 'below', async (v) => {
     if (v === 'cfg') { selectTab('model'); return; }
     const [p, m] = v.split('|');
-    await save({ provider: p, models: { [p]: { chat: m } } }, true);
-    toast(`Модель: ${p}/${m}`, '', 1600);
+    if (p === 'ollama') { await save({ ai_route: S.settings.ai_route === 'cloud' ? 'local_first' : S.settings.ai_route, models: { ollama: { chat: m, lite: m } } }, true); toast(`Локальная модель: ${m}`, '', 1600); buildPages(); return; }
+    await save({ provider: p, models: { [p]: { chat: m } }, ai_route: 'cloud' }, true);
+    toast(`Модель: ${p}/${m} (только облако)`, '', 1600);
     buildPages();
   });
 }
@@ -401,28 +428,123 @@ function buildCommands() {
   };
 }
 
+// ── v1.5: local model (Ollama) + cloud provider ──
+function cloudName() { const p = S.settings.provider; return ({ gemini: 'Gemini', hubris: 'Hubris', custom: 'свой API' })[p] || ((S.providers[p] || {}).label || p); }
+function modelOpts(p, kind) {
+  const info = S.providers[p] || {}; const fetched = (S.modelLists || {})[p];
+  const base = kind === 'lite' ? (info.lite_models || []) : (info.chat_models || []);
+  if (!fetched) return base.map((x) => `<option value="${esc(x)}">`).join('');
+  const seen = new Set(); let h = '';
+  for (const x of base) { seen.add(x); const f = fetched.find((m) => m.id === x); h += `<option value="${esc(x)}" label="${esc('★ ' + ((f && f.label) || 'рекомендую'))}">`; }
+  for (const m of fetched) { if (seen.has(m.id)) continue; if (kind === 'lite' && m.vision === false) continue; h += `<option value="${esc(m.id)}" label="${esc(m.label || '')}">`; }
+  return h;
+}
+function localModel() { return ((S.settings.models || {}).ollama || {}).chat || 'gemma4:12b'; }
+function routeOpts() { const c = cloudName(); return [['local_first', `Локально, ${c} запасной`], ['local', 'Только локально'], ['cloud', `Только ${c}`]]; }
+function gb(x) { return (+x || 0).toFixed(1).replace('.', ','); }
+function localModels() {   // installed first, then recommended ones not yet downloaded
+  const L = S.local || {}; const inst = L.models || []; const rec = L.recommended || [];
+  const has = (n) => inst.some((m) => m.name === n || m.name === n + ':latest');
+  const out = inst.map((m) => ({ name: m.name, label: m.name, sub: `${gb(m.gb)} ГБ${m.params ? ' · ' + m.params : ''}`, installed: true, note: (rec.find((r) => r.name === m.name) || {}).note || '' }));
+  rec.filter((r) => !has(r.name)).forEach((r) => out.push({ name: r.name, label: r.name, sub: `скачать ~${gb(r.gb)} ГБ`, installed: false, note: r.note }));
+  if (!out.some((m) => m.name === localModel())) out.unshift({ name: localModel(), label: localModel(), sub: 'не скачана', installed: false });
+  return out;
+}
+function localStatusHtml() {
+  const L = S.local || {}; const m = localModel(); const c = cloudName(); const pl = S.localPull;
+  if (pl && pl.status !== 'success' && pl.status !== 'error') {
+    const pct = pl.total ? Math.min(100, Math.round(pl.done / pl.total * 100)) : 0;
+    return `<b>Скачиваю ${esc(pl.model)}</b> — ${pl.total ? `${pct}% · ${gb(pl.done / 1e9)} из ${gb(pl.total / 1e9)} ГБ` : esc(pl.status || 'подключаюсь…')}`;
+  }
+  if (!L.installed) return `Ollama не установлена — без неё локальная модель не работает, отвечает ${esc(c)}.`;
+  if (!L.running) return `Ollama установлена, но не запущена. ${esc(NM())} запустит её сам (без окна в трее).`;
+  if (!L.model_ok) return `Модель <b>${esc(m)}</b> не скачана. Скачай её здесь — один раз, потом всё работает без интернета.`;
+  if (L.game && L.gpu_free) return `Сейчас <b>${esc(L.game)}</b> — видеопамять отдана игре, модель выгружена, отвечает ${esc(c)}. Вернётся сама после игры.`;
+  if (L.warming) return `Загружаю <b>${esc(m)}</b> в видеопамять…`;
+  const ld = L.loaded;
+  if (ld) {
+    const gpu = ld.gpu >= 0.99 ? 'целиком на видеокарте' : ld.gpu > 0 ? `на видеокарте ${Math.round(ld.gpu * 100)}%, остальное в ОЗУ` : 'на процессоре';
+    return `<b>Готова</b> · ${esc(ld.name)} · ${gpu} · видеопамять ${gb(ld.vram_gb)} ГБ · выгрузится через ${esc(String(L.keep_alive || '10m').replace('m', ' мин').replace('s', ' с'))} простоя`;
+  }
+  return `Скачана · загрузится в видеопамять при первом вопросе (${L.load_sec ? '~' + gb(L.load_sec) + ' с' : 'несколько секунд'}); пока грузится — отвечает ${esc(c)}.`;
+}
+function renderLocalStatus() {
+  const el = $('#lm-status'); if (!el) return;
+  el.innerHTML = localStatusHtml();
+  const L = S.local || {}; const pl = S.localPull; const busy = pl && pl.status !== 'success' && pl.status !== 'error';
+  const bar = $('#lm-prog'); if (bar) { bar.classList.toggle('on', !!busy); const pct = busy && pl.total ? Math.round(pl.done / pl.total * 100) : 0; bar.querySelector('i').style.width = pct + '%'; }
+  const sel = localModels().find((x) => x.name === localModel()) || {};
+  const dl = $('#lm-dl'); if (dl) { dl.style.display = (L.installed && !sel.installed && !busy) ? '' : 'none'; }
+  const cancel = $('#lm-cancel'); if (cancel) cancel.style.display = busy ? '' : 'none';
+  const inst = $('#lm-install'); if (inst) inst.style.display = L.installed ? 'none' : '';
+  const ul = $('#lm-unload'); if (ul) ul.style.display = L.loaded ? '' : 'none';
+}
 function buildModel() {
   const s = S.settings, p = s.provider, info = S.providers[p];
   const m = s.models[p];
-  $('#p-model').innerHTML = head('Модель', 'Какой ИИ думает за ассистента. Можно переключиться в любой момент.') +
-    `<div class="card sect"><h3>${icon('box', 15)}Провайдер</h3>
-      <div class="seg" id="prov-seg">${Object.entries(S.providers).map(([k, v]) => `<button data-p="${k}" class="${k === p ? 'on' : ''}">${esc(v.label)}</button>`).join('')}</div>
+  const route = s.ai_route || 'local_first';
+  const lms = localModels();
+  const cloud = Object.entries(S.providers).filter(([, v]) => !v.local);
+  $('#p-model').innerHTML = head('Модель', 'Какой ИИ думает за ассистента: локальная модель на твоей видеокарте или облако.') +
+    `<div class="card sect"><h3>${icon('zap', 15)}Где думает ассистент<span class="badge">новое</span></h3>
+      <div class="seg" id="route-seg">${routeOpts().map(([k, l]) => `<button data-r="${k}" class="${k === route ? 'on' : ''}">${esc(l)}</button>`).join('')}</div>
+      <div class="note">${route === 'local_first' ? `Отвечает модель на этом компьютере — без лимитов и без интернета. Если она не запущена, ещё грузится, занята игрой или ошиблась — тут же отвечает ${esc(cloudName())}.` : route === 'local' ? 'Всё только на этом компьютере: ни запросы, ни скриншоты никуда не уходят. Нужна скачанная модель.' : `Всё через ${esc(cloudName())}, как раньше. Локальная модель не используется и не занимает видеопамять.`}</div></div>
+    <div class="card sect" id="lm-card"><h3>${icon('box', 15)}Локальная модель (Ollama)</h3>
+      <div class="row"><div class="grow"><div class="t">Состояние</div><div class="s" id="lm-status"></div>
+        <div class="vprog" id="lm-prog"><i></i><span></span></div></div>
+        <button id="lm-install" class="btn sm" style="display:none">${icon('download', 13)}Скачать Ollama</button>
+        <button id="lm-unload" class="btn sm ghost" style="display:none" title="Освободить видеопамять сейчас">Выгрузить</button></div>
+      <div class="row"><div class="grow"><div class="t">Модель</div><div class="s">${esc((lms.find((x) => x.name === localModel()) || {}).note || 'Нужна модель с поддержкой картинок и инструментов')}</div></div>
+        <select id="lm-model" class="inp" style="max-width:300px">${lms.some((x) => x.installed) ? `<optgroup label="Скачанные">${lms.filter((x) => x.installed).map((x) => `<option value="${esc(x.name)}" ${x.name === localModel() ? 'selected' : ''}>${esc(x.label)} — ${esc(x.sub)}</option>`).join('')}</optgroup>` : ''}
+          ${lms.some((x) => !x.installed) ? `<optgroup label="Можно скачать">${lms.filter((x) => !x.installed).map((x) => `<option value="${esc(x.name)}" ${x.name === localModel() ? 'selected' : ''}>${esc(x.label)} — ${esc(x.sub)}</option>`).join('')}</optgroup>` : ''}</select>
+        <button id="lm-dl" class="btn sm primary" style="display:none">${icon('download', 13)}Скачать модель</button>
+        <button id="lm-cancel" class="btn sm ghost" style="display:none">Отмена</button>
+        <button id="lm-test" class="btn sm">${icon('zap', 13)}Проверить</button></div>
+      <div class="row"><div class="grow"><div class="t">Освобождать видеопамять в играх</div><div class="s">Игра или тяжёлая графическая программа на переднем плане — модель выгружается, отвечает ${esc(cloudName())}; после игры загружается снова</div></div>${tgl('lm-games', s.gpu_free_in_games !== false)}</div>
+      <div class="row"><div class="grow"><div class="t">Держать в видеопамяти после вопроса</div><div class="s">Потом выгружается сама, чтобы не занимать видеокарту зря</div></div>
+        <select id="lm-keep" class="inp" style="max-width:140px">${[5, 10, 30, 60].map((v) => `<option value="${v}" ${v === (s.local_keep_alive_min || 10) ? 'selected' : ''}>${v} мин</option>`).join('')}</select></div>
+      <div class="row" style="border:0"><span id="lm-res" class="result"></span></div></div>
+    <div class="card sect"><h3>${icon('globe', 15)}Облачный провайдер${route === 'local' ? '<span class="badge">не используется</span>' : route === 'local_first' ? '<span class="badge">запасной</span>' : ''}</h3>
+      <div class="seg" id="prov-seg">${cloud.map(([k, v]) => `<button data-p="${k}" class="${k === p ? 'on' : ''}">${esc(v.label)}</button>`).join('')}</div>
       <div class="grid2" style="margin-top:16px">
-        <div class="field"><label>Модель для разговора</label><input id="m-chat" class="inp" list="dl-chat" value="${esc(m.chat)}"><datalist id="dl-chat">${info.chat_models.map((x) => `<option value="${esc(x)}">`).join('')}</datalist></div>
-        <div class="field"><label>Лёгкая модель (проверки экрана)</label><input id="m-lite" class="inp" list="dl-lite" value="${esc(m.lite)}"><datalist id="dl-lite">${info.lite_models.map((x) => `<option value="${esc(x)}">`).join('')}</datalist></div>
+        <div class="field"><label>Модель для разговора</label><input id="m-chat" class="inp" list="dl-chat" placeholder="${info.editable_base ? 'например openai/gpt-4o-mini' : ''}" value="${esc(m.chat)}"><datalist id="dl-chat">${modelOpts(p, 'chat')}</datalist></div>
+        <div class="field"><label>Лёгкая модель (проверки экрана, быстрые голосовые ответы)</label><input id="m-lite" class="inp" list="dl-lite" value="${esc(m.lite)}"><datalist id="dl-lite">${modelOpts(p, 'lite')}</datalist></div>
       </div>
-      <div class="field" style="margin-top:12px"><label>API-ключ ${esc(info.label)} · <span class="link" id="key-link">получить ключ</span></label>
-        <div class="inp-wrap"><input id="m-key" class="inp" type="password" placeholder="вставь ключ сюда" value="${esc(s.api_keys[p] || '')}"><button class="eye" id="key-eye">${icon('eye', 15)}</button></div></div>
-      <details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Дополнительно: адрес API</summary>
-        <div class="field" style="margin-top:8px"><input id="m-base" class="inp" value="${esc(s.base_urls[p] || info.base_url)}"></div></details>
+      ${info.openai_compat ? `<div class="row" style="border:0;padding-top:6px"><button id="m-list" class="btn sm">${icon('download', 13)}Обновить список моделей</button><span id="m-list-res" class="result">${(S.modelLists || {})[p] ? `В списке ${S.modelLists[p].length} моделей — начни печатать в поле модели` : 'Подтянет все модели сервиса в подсказки (нужен ключ)'}</span></div>` : ''}
+      ${info.editable_base ? `<div class="field" style="margin-top:12px"><label>Адрес API (base URL)</label><input id="m-base" class="inp" placeholder="https://openrouter.ai/api/v1" value="${esc(s.base_urls[p] || info.base_url)}">
+        <div class="note" style="margin-top:6px">Примеры: OpenRouter — https://openrouter.ai/api/v1 · Groq — https://api.groq.com/openai/v1 · DeepSeek — https://api.deepseek.com/v1 · LM Studio — http://127.0.0.1:1234/v1 (ключ любой)</div></div>` : ''}
+      <div class="field" style="margin-top:12px"><label>API-ключ ${esc(info.label)}${info.key_url ? ' · <span class="link" id="key-link">получить ключ</span>' : ''}</label>
+        <div class="inp-wrap"><input id="m-key" class="inp" type="password" placeholder="${p === 'hubris' ? 'sk-gw-…' : 'вставь ключ сюда'}" value="${esc(s.api_keys[p] || '')}"><button class="eye" id="key-eye">${icon('eye', 15)}</button></div></div>
+      ${info.editable_base ? '' : `<details style="margin-top:10px"><summary class="note" style="cursor:pointer;margin:0">Дополнительно: адрес API</summary>
+        <div class="field" style="margin-top:8px"><input id="m-base" class="inp" value="${esc(s.base_urls[p] || info.base_url)}"></div></details>`}
       <div class="row" style="margin-top:12px;border:0"><button id="m-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="m-test" class="btn">${icon('zap', 15)}Проверить</button><span id="m-res" class="result"></span></div>
-      <div class="note">Бесплатный Gemini: около 10 запросов в минуту и ограничение в день. При лимите ${esc(NM())} скажет об этом, временно перейдёт на лёгкую модель и реже проверяет экран. <b>gemini-2.5-flash</b> недоступна для новых ключей — по умолчанию <b>gemini-3.5-flash</b>.</div></div>`;
-  $$('#prov-seg button').forEach((b) => b.onclick = async () => { await save({ provider: b.dataset.p }, true); buildModel(); renderComposer(); toast('Провайдер: ' + S.providers[b.dataset.p].label, '', 1500); });
-  $('#key-link').onclick = () => API.open_link(info.key_url);
+      <div class="note">${p === 'hubris' ? 'Hubris — оплата в рублях, сотни моделей одним ключом (Gemini, GPT, Claude, DeepSeek, Qwen, GLM, Kimi и бесплатные). Нужны модели с инструментами (управление ПК) и картинками (живой режим, экран). Если на балансе кончатся деньги, ' + esc(NM()) + ' так и скажет.' : p === 'custom' ? 'Любой сервис с OpenAI-совместимым API (/v1/chat/completions). Для управления ПК модель должна уметь вызывать функции (tools), для экрана — принимать картинки.' : p === 'gemini' ? `Бесплатный Gemini: около 10 запросов в минуту и ограничение в день. При лимите ${esc(NM())} скажет об этом, временно перейдёт на лёгкую модель и реже проверяет экран.` : 'Платный API: запросы списываются с баланса провайдера.'}</div></div>`;
+  $$('#route-seg button').forEach((b) => b.onclick = async () => { await save({ ai_route: b.dataset.r }, true); buildModel(); renderComposer(); toast(routeOpts().find((x) => x[0] === b.dataset.r)[1], '', 1600); });
+  $('#lm-model').onchange = async (e) => { const v = e.target.value; await save({ models: { ollama: { chat: v, lite: v } } }, true); buildModel(); renderComposer();
+    const x = localModels().find((y) => y.name === v); if (x && !x.installed) toast(`Модель ${v} ещё не скачана — нажми «Скачать модель»`, '', 3500); };
+  $('#lm-dl').onclick = async () => { const r = await API.local_pull(localModel()); if (!r.ok) toast(r.error || 'Уже что-то скачивается', 'err'); else { S.localPull = { model: localModel(), status: 'подключаюсь…', done: 0, total: 0 }; renderLocalStatus(); } };
+  $('#lm-cancel').onclick = () => API.local_cancel_pull();
+  $('#lm-install').onclick = () => API.open_link('https://ollama.com/download/windows');
+  $('#lm-unload').onclick = async () => { const r = await API.local_unload(); if (r.local) S.local = r.local; renderLocalStatus(); toast('Видеопамять освобождена', '', 1500); };
+  $('#lm-test').onclick = async () => { $('#lm-res').textContent = 'Проверяю (первый раз модель грузится несколько секунд)…'; $('#lm-res').textContent = await API.test_ai('ollama', {}); API.local_info(true).then((l) => { S.local = l; renderLocalStatus(); }); };
+  $('#lm-games').onclick = async (e) => { const on = !e.currentTarget.classList.contains('on'); await save({ gpu_free_in_games: on }, true); e.currentTarget.classList.toggle('on', on); };
+  $('#lm-keep').onchange = async (e) => { await save({ local_keep_alive_min: +e.target.value }, true); };
+  renderLocalStatus();
+  $$('#prov-seg button').forEach((b) => b.onclick = async () => { await save({ provider: b.dataset.p }, true); buildModel(); renderComposer(); toast('Облачный провайдер: ' + S.providers[b.dataset.p].label, '', 1500); });
+  if ($('#key-link')) $('#key-link').onclick = () => API.open_link(info.key_url);
   $('#key-eye').onclick = () => { const k = $('#m-key'); k.type = k.type === 'password' ? 'text' : 'password'; };
   const collect = () => ({ models: { [p]: { chat: $('#m-chat').value.trim(), lite: $('#m-lite').value.trim() } }, api_keys: { [p]: $('#m-key').value.trim() }, base_urls: { [p]: $('#m-base').value.trim() } });
   $('#m-save').onclick = async () => { await save(collect()); };
   $('#m-test').onclick = async () => { $('#m-res').textContent = 'Проверяю…'; const r = await API.test_ai(p, collect()); $('#m-res').textContent = r; };
+  if ($('#m-list')) $('#m-list').onclick = async () => {
+    const res = $('#m-list-res'); res.textContent = 'Загружаю список…';
+    const r = await API.list_models(p, collect());
+    if (!r || !r.ok) { res.textContent = (r && r.error) || 'Не удалось получить список'; return; }
+    S.modelLists = Object.assign(S.modelLists || {}, { [p]: r.models || [] });
+    $('#dl-chat').innerHTML = modelOpts(p, 'chat'); $('#dl-lite').innerHTML = modelOpts(p, 'lite');
+    const tools = (r.models || []).filter((x) => x.tools).length;
+    res.textContent = `Загружено ${r.count} моделей${tools ? `, с инструментами — ${tools}` : ''}. Начни печатать в поле модели.`;
+  };
 }
 
 const ANSWER_LANGS = [['auto', 'Как я спросил'], ['ru', 'Русский'], ['uk', 'Українська'], ['en', 'English'], ['de', 'Deutsch'], ['pl', 'Polski']];
@@ -448,7 +570,12 @@ function buildVoice() {
       <div class="row"><div class="grow"><div class="t">Язык ответов</div><div class="s">Текст и голос: ответы в чате, живой режим, страж фокуса, напоминания, короткие фразы вроде «Открываю». Интерфейс остаётся русским</div></div>
         <select id="v-alang" class="inp" style="max-width:200px">${langOpts(ANSWER_LANGS, s.answer_lang || 'ru')}</select></div>
       <div class="row"><div class="grow"><div class="t">Язык, на котором я говорю</div><div class="s" id="v-sttlang"></div></div>
-        <select id="v-slang" class="inp" style="max-width:200px">${langOpts(ANSWER_LANGS.slice(1), s.speech_lang || 'ru')}</select></div></div>
+        <select id="v-slang" class="inp" style="max-width:200px">${langOpts(ANSWER_LANGS.slice(1), s.speech_lang || 'ru')}</select></div>
+      <div class="row"><div class="grow"><div class="t">Английские команды</div><div class="s">Если русская модель услышала английскую фразу («write … on Telegram», «play … on Spotify») — перепроверю её английской моделью Vosk (~41 МБ, скачается сама при первой такой фразе)</div></div>${tgl('v-enpass', s.stt_en_pass !== false)}</div>
+      <div class="field" style="margin-top:8px"><label>Имена контактов для голоса</label><input id="v-contacts" class="inp" maxlength="1500" placeholder="Nehto, Мама=@mama_tg, Саша" value="${esc((s.voice_contacts || []).join(', '))}"></div>
+      <div class="note">Через запятую. Английские имена на слух распознаются плохо — по этому списку «next door» станет «Nehto» в командах вроде «write Nehto on Telegram, hello».
+        Можно сразу указать, кого открыть в Telegram: <b>Мама=@mama_tg</b> или <b>Сеня=Семён Петров</b> — скажешь «напиши Сене привет», откроется нужный чат.</div></div>
+    ${sttCard()}
     <div class="card sect" id="v-voicecard"><h3>${icon('vol', 15)}Голос ассистента</h3>
       <div class="row"><div class="grow"><div class="t">Синтез речи</div><div class="s" id="v-tstat"></div></div>
         <div class="seg" id="v-engine"><button data-e="piper" class="${local ? 'on' : ''}">Локальный (быстрый)</button><button data-e="edge" class="${local ? '' : 'on'}">Microsoft Edge (онлайн)</button></div></div>
@@ -476,6 +603,7 @@ function buildVoice() {
       <div class="note" id="v-timing"></div></div>
     <div class="card sect"><h3>${icon('keyboard', 15)}Горячая клавиша</h3>
       <div class="row"><div class="grow"><div class="t" id="v-hk">${esc(S.hotkey)}</div><div class="s">Удерживай — говоришь. Короткое нажатие — слушаю до паузы. Повторное — стоп.</div></div><button id="v-hk-btn" class="btn">Изменить</button></div></div>
+    ${followCard()}
     <div class="card sect"><h3>${icon('mic', 15)}Слово-активатор</h3>
       <div class="row"><div class="grow"><div class="t">Как звать голосом</div><div class="s" id="v-wstat"></div></div>
         <div class="seg" id="v-wmode">${WAKE_MODES.map(([k, l]) => `<button data-w="${k}" class="${k === s.wake_mode ? 'on' : ''}">${k === 'name' ? esc(`По имени «${NM()}»`) : l}</button>`).join('')}</div></div>
@@ -485,6 +613,9 @@ function buildVoice() {
         Слово-активатор распознаётся офлайн, звук никуда не отправляется. Имя слушает русская модель Vosk (~45 МБ); просьба после имени распознаётся на твоём языке.</div></div>`;
   $('#v-alang').onchange = async () => { const v = $('#v-alang').value; if (await save({ answer_lang: v }, true)) { S.voiceLang = v === 'auto' ? null : v; toast(`Язык ответов: ${ANSWER_LANGS.find((x) => x[0] === v)[1]}`, '', 1800); buildVoice(); } };
   $('#v-slang').onchange = async () => { const v = $('#v-slang').value; if (await save({ speech_lang: v }, true)) { toast(`Говоришь: ${LANG_NAME[v]}`, '', 1800); buildVoice(); } };
+  $('#v-enpass').onclick = async () => { await save({ stt_en_pass: S.settings.stt_en_pass === false }, true); buildVoice(); };
+  bindSttCard();
+  $('#v-contacts').onchange = () => save({ voice_contacts: $('#v-contacts').value.split(/[,;\n]/).map((x) => x.trim()).filter(Boolean) }, true);
   $('#v-vlang').onchange = () => { S.voiceLang = $('#v-vlang').value; buildVoice(); };
   $$('#v-engine [data-e]').forEach((b) => b.onclick = async () => { if (await save({ tts_engine: b.dataset.e }, true)) { buildVoice(); toast(b.dataset.e === 'piper' ? 'Голос: локальный (быстрый)' : 'Голос: Microsoft Edge (онлайн)', '', 1600); } });
   if ($('#v-pvoice')) $('#v-pvoice').onchange = async () => { const k = $('#v-pvoice').value; if (await save(voicePatch(vl, k), true)) {
@@ -514,10 +645,68 @@ function buildVoice() {
     $('#v-thr').onchange = () => save({ [S.settings.wake_mode === 'name' ? 'name_threshold' : 'wake_threshold']: +$('#v-thr').value / 100 }, true);
   }
   $$('#v-wmode [data-w]').forEach((b) => b.onclick = () => setWakeMode(b.dataset.w));
+  bindFollowCard();
   renderWakeStatus();
   renderTtsStatus();
+  renderWhisperStatus();
   $('#v-speak').onclick = async () => { await save({ speak_replies: !S.settings.speak_replies }, true); buildVoice(); };
   $('#v-hk-btn').onclick = captureHotkey;
+}
+// ── v1.5.x: offline speech recognition engine (Vosk / Whisper) ──
+const WH_DEVICES = [['auto', 'Авто'], ['cuda', 'Видеокарта NVIDIA'], ['cpu', 'Процессор']];
+const WH_LANGS = [['pair', 'Мой язык + английский'], ['speech', 'Только мой язык'], ['auto', 'Любой (автоопределение)']];
+function sttCard() {
+  const s = S.settings; const w = (S.tts || {}).whisper || {};
+  const wh = s.stt_engine === 'whisper';
+  const cat = w.catalog || [];
+  return `<div class="card sect" id="v-sttcard"><h3>${icon('mic', 15)}Распознавание речи (офлайн)<span class="badge">новое</span></h3>
+      <div class="row"><div class="grow"><div class="t">Движок</div><div class="s">Vosk работает сразу и почти без нагрузки. Whisper заметно точнее (особенно английский и смешанная речь), но нужна загрузка модели и лучше видеокарта NVIDIA</div></div>
+        <div class="seg" id="v-stteng"><button data-g="vosk" class="${wh ? '' : 'on'}">Vosk (лёгкий, сразу)</button><button data-g="whisper" class="${wh ? 'on' : ''}">Whisper (точнее, нужна загрузка)</button></div></div>
+      ${wh ? `<div class="grid3" style="margin-top:8px">
+        <div class="field"><label>Модель Whisper</label><select id="v-whmodel" class="inp">${cat.map((m) => `<option value="${esc(m.key)}" ${m.key === s.whisper_model ? 'selected' : ''}>${esc(m.label)} · ~${m.mb} МБ${m.installed ? ' · скачана' : ''}</option>`).join('')}</select></div>
+        <div class="field"><label>Где считать</label><select id="v-whdev" class="inp">${langOpts(WH_DEVICES, s.whisper_device || 'auto')}</select></div>
+        <div class="field"><label>Языки фразы</label><select id="v-whlang" class="inp">${langOpts(WH_LANGS, s.whisper_lang || 'pair')}</select></div></div>
+      <div class="row" style="margin-top:8px"><div class="grow"><div class="t">Состояние</div><div class="s" id="v-whstat"></div></div>
+        <div id="v-whbtns" style="display:flex;gap:6px"></div></div>
+      <div class="note">Whisper распознаёт фразу целиком, когда ты договорил: на видеокарте ~0,2–0,6 с, на процессоре 2–8 с. Имя-активатор по-прежнему слушает Vosk, а если Whisper не уверен — подстрахует Vosk/Gemini.
+        Модель и библиотека CUDA (~550 МБ, для видеокарты) скачиваются один раз в <b>%LOCALAPPDATA%\\Jarvis\\whisper</b>. Пока Whisper включён, он держит ~1,5–2 ГБ видеопамяти (вместе с локальной моделью ИИ); выключи — память освободится.
+        Первый запуск на RTX 50xx дольше (драйвер один раз компилирует ядра).</div>` : `
+      <div class="row" style="margin-top:4px"><div class="grow"><div class="t">Английская модель Vosk</div><div class="s">Для проверки английских команд. Точная — заметно меньше ошибок в английских словах, скачается в фоне</div></div>
+        <select id="v-enmodel" class="inp" style="max-width:240px">${langOpts([['small', 'Маленькая (~41 МБ)'], ['lgraph', 'Точная (~128 МБ)']], s.stt_en_model || 'small')}</select></div>`}
+    </div>`;
+}
+function bindSttCard() {
+  $$('#v-stteng [data-g]').forEach((b) => b.onclick = async () => {
+    const g = b.dataset.g; const patch = { stt_engine: g }; if (g === 'whisper') patch.stt_mode = 'local';
+    if (await save(patch, true)) { S.tts = Object.assign(S.tts || {}, await API.tts_info()); buildVoice();
+      const w = (S.tts || {}).whisper || {};
+      if (g === 'whisper') toast(!w.available ? 'Whisper не входит в эту сборку' : (w.catalog || []).some((m) => m.key === S.settings.whisper_model && m.installed) ? 'Распознавание: Whisper' : 'Нажми «Скачать», чтобы загрузить модель Whisper', '', 2600);
+      else toast('Распознавание: Vosk', '', 1600); } });
+  const ch = (id, key) => { const el = $(id); if (el) el.onchange = async () => { if (await save({ [key]: el.value }, true)) { S.tts = Object.assign(S.tts || {}, await API.tts_info()); buildVoice(); } }; };
+  ch('#v-whmodel', 'whisper_model'); ch('#v-whdev', 'whisper_device'); ch('#v-whlang', 'whisper_lang');
+  if ($('#v-enmodel')) $('#v-enmodel').onchange = async () => { const v = $('#v-enmodel').value; if (await save({ stt_en_model: v }, true) && v === 'lgraph') toast('Скачиваю точную английскую модель (~128 МБ) в фоне', '', 2400); };
+}
+function renderWhisperStatus() {
+  const el = $('#v-whstat'); const bx = $('#v-whbtns'); if (!el || !bx) return;
+  const s = S.settings; const w = (S.tts || {}).whisper || {};
+  const m = (w.catalog || []).find((x) => x.key === s.whisper_model) || {};
+  const d = S.whisperDl; let txt; let btns = '';
+  if (!w.available) txt = 'Whisper не входит в эту сборку (нет faster-whisper) — распознаёт Vosk' + (w.import_error ? ` · ${w.import_error}` : '');
+  else if (w.downloading) {
+    const pct = d && d.total ? Math.round(d.done / d.total * 100) : 0;
+    txt = (d && d.stage === 'cuda' ? 'Скачиваю библиотеку CUDA для видеокарты… ' : `Скачиваю модель ${w.downloading}… `) + (d && d.total ? `${pct}% · ${mb(d.done)} из ${mb(d.total)} МБ` : '');
+    btns = `<button class="btn sm ghost" id="v-whcancel">${icon('x', 13)}Отменить</button>`;
+  } else if (!m.installed) { txt = `Модель не скачана (~${m.mb || '?'} МБ${w.gpu && s.whisper_device !== 'cpu' && !w.cuda ? ' + ~550 МБ CUDA' : ''}) — пока распознаёт Vosk`; btns = `<button class="btn sm" id="v-whdl">${icon('download', 13)}Скачать</button>`; }
+  else if (w.loading) txt = 'Загружаю модель в память…';
+  else if (w.loaded && w.loaded_model === s.whisper_model) txt = `Работает: ${m.label || w.loaded_model} · ${w.device === 'cuda' ? 'видеокарта' + (w.gpu ? ' ' + w.gpu : '') : 'процессор'}${w.gpu_error && w.device !== 'cuda' ? ' (видеокарта не запустилась: ' + w.gpu_error + ')' : ''}`;
+  else txt = w.error ? `Ошибка: ${w.error}` : 'Скачана — загрузится при следующей фразе';
+  if (m.installed && !w.downloading) btns += `<button class="btn sm ghost" id="v-whdel">${icon('trash', 13)}Удалить</button>`;
+  if (w.error && w.available && !w.downloading && !txt.includes(w.error)) txt += ` · ${w.error}`;
+  el.textContent = txt; bx.innerHTML = btns;
+  if ($('#v-whdl')) $('#v-whdl').onclick = async () => { const r = await API.whisper_download(s.whisper_model); if (r && r.whisper) { S.tts = Object.assign(S.tts || {}, { whisper: r.whisper }); renderWhisperStatus(); } };
+  if ($('#v-whcancel')) $('#v-whcancel').onclick = () => API.whisper_cancel();
+  if ($('#v-whdel')) $('#v-whdel').onclick = async () => { if (!confirm(`Удалить модель Whisper «${m.label || s.whisper_model}» с диска?`)) return;
+    const r = await API.whisper_delete(s.whisper_model); if (r && r.whisper) S.tts = Object.assign(S.tts || {}, { whisper: r.whisper }); toast(r && r.ok ? 'Модель удалена' : 'Не получилось удалить', r && r.ok ? '' : 'err', 2000); buildVoice(); };
 }
 const EDGE_AUTO = { uk: 'uk-UA-OstapNeural / PolinaNeural (по полу русского голоса)', en: 'en-US-GuyNeural / JennyNeural (по полу русского голоса)',
   de: 'de-DE-ConradNeural / KatjaNeural (по полу русского голоса)', pl: 'pl-PL-MarekNeural / ZofiaNeural (по полу русского голоса)' };
@@ -560,6 +749,7 @@ function renderTtsStatus() {
     const x = t.stt || {}; const d = (S.sttDl && S.sttDl.lang === x.lang) ? S.sttDl : (x.lang === 'ru' ? S.wakeDl : null) || {};
     sl.textContent = s.stt_mode === 'cloud' ? 'Распознаёт Gemini (выбрано в «Скорость ответа»)'
       : x.error ? x.error + ' — пока распознаёт Gemini'
+      : (s.stt_engine === 'whisper' && ((t.whisper || {}).loaded)) ? `Распознаю офлайн (Whisper, ${LANG_NAME[x.lang] || ''}${s.whisper_lang === 'pair' && x.lang !== 'en' ? ' + английский' : ''})`
       : x.model ? `Распознаю офлайн (Vosk, ${LANG_NAME[x.lang] || ''})`
       : x.downloading ? `Скачиваю модель распознавания (${LANG_NAME[x.lang] || ''}, ~${x.mb} МБ)… ${d.total ? Math.round(d.done / d.total * 100) + '%' : ''}`
       : `Модель для этого языка (~${x.mb || 50} МБ) скачается при первой фразе — пока распознаёт Gemini`;
@@ -568,6 +758,7 @@ function renderTtsStatus() {
   if (st) {
     const x = t.stt || {}; const d = S.wakeDl || {};
     st.textContent = s.stt_mode === 'cloud' ? 'Звук уходит в Gemini: точнее на шуме, но +1–2 с и ещё один запрос к лимиту'
+      : (s.stt_engine === 'whisper' && ((t.whisper || {}).loaded)) ? 'Whisper, офлайн: точнее, фраза распознаётся целиком после паузы. Если не уверен — Vosk, потом Gemini'
       : x.model ? 'Vosk, офлайн: текст готов сразу, как договорил. Если не уверен в словах — спрошу Gemini'
       : (x.downloading || S.wakeDl) ? `Скачиваю модель распознавания… ${d.total ? Math.round(d.done / d.total * 100) : 0}%`
       : 'Модель распознавания не скачана — скачаю, пока распознаёт Gemini';
@@ -577,7 +768,7 @@ function renderTtsStatus() {
     const x = t.timing;
     const f = (v) => v == null ? '—' : v.toFixed(2).replace('.', ',');
     tm.innerHTML = x && x.first_audio != null ? `Последний голосовой ответ: <b>${f(x.first_audio)} с</b> от конца фразы до первого звука
-      (пауза ${f(x.endpoint)} · распознавание ${f(x.stt)}${x.stt_mode ? ' ' + (x.stt_mode === 'cloud' ? 'Gemini' : 'локально') : ''} · модель ${f(x.llm_first)} · синтез ${f(x.tts)} · старт ${f(x.play)}).`
+      (пауза ${f(x.endpoint)} · распознавание ${f(x.stt)}${x.stt_mode ? ' ' + (x.stt_mode === 'cloud' ? 'Gemini' : x.stt_mode === 'whisper' ? 'Whisper' : 'локально') : ''} · модель ${f(x.llm_first)} · синтез ${f(x.tts)} · старт ${f(x.play)}).`
       : 'Ответ озвучивается по предложениям, пока модель ещё пишет: первая фраза звучит сразу.';
   }
 }
@@ -632,6 +823,52 @@ async function toggleLive() {
   if (r && r.ok) { S.settings = r.settings; S.live = r.live; renderComposer(); buildAI();
     toast(on ? 'Живой режим включён: подскажу, когда это уместно' : 'Живой режим выключен', '', 2400); }
 }
+// ── v1.6 conversation mode chip + PC hearing status ──
+function renderFollow() {
+  const el = $('#follow-chip'); if (!el) return;
+  const f = S.follow || {};
+  el.classList.toggle('hidden', !f.active);
+  if (!f.active) return;
+  el.classList.toggle('wait', !f.listening);
+  const txt = f.always ? 'слушаю всегда' : `слушаю… ещё ${esc(f.left || '')}`;
+  el.innerHTML = `<span class="fdot"></span><span>${txt}</span><span class="x">${icon('x', 11)}</span>`;
+  el.title = (f.listening ? 'Можно продолжать без имени' : 'Подожду, пока договорю') + ' — нажми, чтобы закончить (или скажи «хватит»)';
+}
+async function followStop() { const r = await API.follow_stop(); if (r && r.follow) { S.follow = r.follow; renderFollow(); } }
+function renderPcStatus() {
+  const el = $('#v-pchstat'); if (!el) return;
+  const p = S.pcHearing || {};
+  let t;
+  if (!S.settings.pc_hearing) t = p.available === false ? `Недоступно в этой сборке: ${p.import_error || ''}` : 'Выключено';
+  else t = p.status || 'Запускаю…';
+  el.textContent = t;
+}
+async function refreshPcPeek() {
+  const box = $('#v-pcpeek'); if (!box) return;
+  const p = await API.pc_hearing_info(); S.pcHearing = p; renderPcStatus();
+  const r = p.recent || [];
+  box.innerHTML = r.length ? r.map((x) => `<div><span class="tm">${esc(x.t)}</span>${esc(x.text)}${x.window ? ` <span class="tm">· ${esc(x.window)}</span>` : ''}</div>`).join('')
+    : '<div class="tm">Пока ничего не расслышал. Включи видео с речью — через пару секунд здесь появится текст.</div>';
+}
+function followCard() {
+  const s = S.settings; const fm = s.follow_mode || '2m';
+  return `<div class="card sect" id="v-followcard"><h3>${icon('mic', 15)}Разговор без имени<span class="badge">новое</span></h3>
+      <div class="row"><div class="grow"><div class="t">Слушать после ответа</div><div class="s">После ответа можно продолжать без «${esc(NM())}»: таймер начинается заново после каждого ответа. «Хватит», «пока» или «стоп слушать» — закончить разговор</div></div>
+        <div class="seg" id="v-follow">${FOLLOW_MODES.map(([k, l]) => `<button data-f="${k}" class="${k === fm ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+      ${fm === 'always' ? `<div class="note">«Всегда»: микрофон слушает постоянно, имя не нужно. Обрывки, шум и чужие разговоры отсеиваются, а если фраза явно не мне — промолчу. Звук игр и видео из колонок лучше отсеивается, если включить «Слышать звук ПК». В наушниках работает лучше всего.</div>` : ''}
+      <div class="row"><div class="grow"><div class="t">Слышать звук ПК</div><div class="s" id="v-pchstat"></div></div>${tgl('v-pch', !!s.pc_hearing)}</div>
+      ${s.pc_hearing ? `<div class="row"><div class="grow"><div class="t">Что я слышу с ПК</div><div class="s">Последние распознанные фразы (хранятся только в памяти ~3 минуты)</div></div><button class="btn sm" id="v-pcref">${icon('refresh', 13)}Обновить</button></div><div class="pcpeek" id="v-pcpeek"></div>` : ''}
+      <div class="note">Звук ПК (видео, игры, звонки) я распознаю у себя на компьютере и помню ~3 минуты — можно спросить «что он сейчас сказал?». Это только контекст: команды из колонок я не выполняю. Пока я говорю, звук ПК не слушаю.
+        Распознаёт Whisper на видеокарте (если включён и игра не занимает видеокарту), иначе Vosk на процессоре; музыка и неразборчивая речь распознаются плохо. Звук никуда не отправляется — в модель уходит только текст.</div></div>`;
+}
+function bindFollowCard() {
+  $$('#v-follow [data-f]').forEach((b) => b.onclick = async () => { const v = b.dataset.f; if (await save({ follow_mode: v }, true)) {
+    toast(v === 'off' ? 'После ответа снова нужно имя' : v === 'always' ? 'Слушаю всегда — имя не нужно' : `Слушаю ${FOLLOW_MODES.find((x) => x[0] === v)[1]} после ответа`, '', 2200); buildVoice(); } });
+  $('#v-pch').onclick = async () => { const on = !S.settings.pc_hearing; if (await save({ pc_hearing: on }, true)) {
+    toast(on ? 'Слушаю звук ПК (только как контекст)' : 'Звук ПК больше не слушаю', '', 2200); buildVoice(); if (on) setTimeout(refreshPcPeek, 2500); } };
+  if ($('#v-pcref')) { $('#v-pcref').onclick = refreshPcPeek; refreshPcPeek(); }
+  renderPcStatus();
+}
 function renderLiveStatus() {
   const el = $('#a-lstat'); if (el) el.textContent = S.live.enabled ? (S.live.status || 'Включён') : 'Выключен';
   const t = $('#a-live'); if (t) t.classList.toggle('on', !!S.live.enabled);
@@ -658,7 +895,7 @@ function buildAI() {
   const prVoice = pr ? (local ? (EDGE2PIPER[pr.voice] || s.piper_voice) : pr.voice) : '';
   const curVoice = local ? s.piper_voice : s.voice;
   const sugg = pr && (prVoice !== curVoice || pr.rate !== s.tts_rate) ? { ...pr, voice: prVoice } : null;
-  $('#p-ai').innerHTML = head('ИИ', 'Имя и характер ассистента, и то, как он следит за фокусом.') +
+  $('#p-ai').innerHTML = head('ИИ', 'Имя, характер, память компаньона, управление ПК и как он следит за фокусом.') +
     `<div class="card sect"><h3>${icon('spark', 15)}Имя</h3>
       <div class="grid2"><div class="field"><label>Как зовут ассистента</label><input id="a-aname" class="inp" maxlength="30" placeholder="Джарвис" value="${esc(s.assistant_name || 'Джарвис')}"></div>
         <div class="field"><label>Как ассистенту обращаться к тебе</label><input id="a-name" class="inp" maxlength="40" placeholder="Имя (необязательно)" value="${esc(s.user_name)}"></div></div>
@@ -672,7 +909,15 @@ function buildAI() {
       <div class="field" style="margin-top:12px"><label>Дополнительные пожелания (что важно знать о тебе, о чём помнить)</label>
         <textarea id="a-persona" class="inp" placeholder="Например: я учусь в 10 классе, готовлюсь к ЕГЭ. Шути иногда.">${esc(s.persona)}</textarea></div>
       <div class="row" style="margin-top:6px"><div class="grow"><div class="t">Подтверждать опасные действия</div><div class="s">Спрашивать перед открытием программ, файлов и сайтов</div></div>${tgl('a-confirm', s.confirm_actions)}</div>
-      <div class="row"><button id="a-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="a-reset" class="btn ghost">${icon('refresh', 14)}Новый чат — очистить память разговора</button></div></div>
+      <div class="field" style="margin-top:12px"><label>Управление компьютером</label>
+        <select id="a-pc" class="inp">
+          <option value="safe" ${s.pc_control === 'safe' ? 'selected' : ''}>Безопасный — открыть, поиск, экран, громкость</option>
+          <option value="standard" ${(s.pc_control || 'standard') === 'standard' ? 'selected' : ''}>Стандарт — + музыка и медиаклавиши (Spotify)</option>
+          <option value="full" ${s.pc_control === 'full' ? 'selected' : ''}>Полный — полный доступ и контроль над ПК (окна, ввод, команды, телеграм, скрипты от админа…)</option>
+        </select></div>
+      <div class="note">«Полный» = полный доступ и контроль над ПК: закрытие/фокус/сворачивание окон, ввод текста и горячие клавиши, shell-команды (опасные — только после твоего «да»), Telegram Desktop, скрипты .ps1/.bat/.py с окном UAC, блокировка, сон и гашение монитора, скриншот/заголовок активного окна. Жёсткие запреты: нет тихого обхода UAC; нет массового удаления файлов и форматирования дисков; закрытие окон мягкое (без kill процесса). Telegram — best-effort (нужен открытый и залогиненный клиент). Секреты и тексты сообщений в лог не пишутся.</div>
+      <div class="row"><button id="a-save" class="btn primary">${icon('check', 15)}Сохранить</button><button id="a-reset" class="btn ghost">${icon('refresh', 14)}Новый чат — очистить историю разговора</button></div></div>
+    ${typeof memoryCard === 'function' ? memoryCard() : ''}
     <div class="card sect" id="a-livecard"><h3>${icon('eye', 15)}Живой режим<span class="badge">новое</span></h3>
       <div class="row"><div class="grow"><div class="t">Сам поглядывать на экран и подсказывать</div><div class="s" id="a-lstat">${esc(S.live.enabled ? (S.live.status || 'Включён') : 'Выключен')}</div></div>${tgl('a-live', S.live.enabled)}</div>
       <div class="row"><div class="grow"><div class="t">Разговорчивость</div><div class="s">Редко — только очевидные случаи; часто — смелее и с меньшими паузами</div></div>
@@ -699,6 +944,14 @@ function buildAI() {
     $('#a-vapply').onclick = async () => { if (await save(local ? { piper_voice: sugg.voice, tts_rate: sugg.rate } : { voice: sugg.voice, tts_rate: sugg.rate }, true)) { toast(`Голос: ${vname(sugg.voice)}`, '', 1800); buildAI(); buildVoice(); } };
   }
   $('#a-confirm').onclick = async () => { await save({ confirm_actions: !S.settings.confirm_actions }, true); buildAI(); };
+  $('#a-pc').onchange = async () => {
+    const v = $('#a-pc').value;
+    if (await save({ pc_control: v }, true)) {
+      const labels = { safe: 'безопасный', standard: 'стандарт', full: 'полный' };
+      toast('Управление ПК: ' + (labels[v] || v), '', 1800);
+      buildAI(); buildCommands();
+    }
+  };
   $('#a-save').onclick = async () => {
     const txt = $('#a-char').value.trim(); const cur = presetOf(S.settings.character_preset);
     const patch = { user_name: $('#a-name').value.trim(), persona: $('#a-persona').value, assistant_name: $('#a-aname').value.trim() || 'Джарвис' };
@@ -716,6 +969,7 @@ function buildAI() {
   $('#a-lint').onchange = () => save({ live_interval_sec: +$('#a-lint').value });
   $('#a-lgap').onchange = () => save({ live_min_gap_sec: +$('#a-lgap').value });
   $('#a-lrep').onchange = () => save({ live_reply_sec: +$('#a-lrep').value });
+  if (typeof bindMemory === 'function') bindMemory();
 }
 function selOpts(opts, cur, fmt) {
   if (!opts.some((o) => o[0] === cur)) opts = [...opts, [cur, fmt(cur)]].sort((a, b) => a[0] - b[0]);
@@ -808,6 +1062,9 @@ function buildSettings() {
       <div class="row"><div class="grow"><div class="t">Установлена <b>v${esc(S.version)}</b></div><div class="s">Можно обновиться или откатиться на любую версию. Настройки, ключ и история сохраняются.</div></div>
         <button id="s-repo" class="btn ghost sm">${icon('github', 14)}GitHub</button></div>
       <div id="s-vlist" class="vlist"><div class="vempty">Загружаю список версий…</div></div></div>
+    <div class="card sect" id="s-phone"><h3>${icon('chat', 15)}Телефон</h3>
+      <div class="row"><div class="grow"><div class="t">Пульт в той же сети</div><div class="s" id="s-phone-url">Запускается вместе с Джарвисом. Телефон пишет в чат, ответ идёт с этого компьютера.</div></div></div>
+      <div class="row"><div class="grow"><div class="t">PIN</div><div class="s" id="s-phone-pin">······</div></div><button id="s-phone-new" class="btn sm">Новый PIN</button></div></div>
     <div class="card sect"><h3>${icon('app', 15)}Окно и запуск</h3>
       <div class="row"><div class="grow"><div class="t">Запускать вместе с Windows</div><div class="s">Стартует свёрнутым в трей</div></div>${tgl('s-auto', S.autostart)}</div>
       <div class="row"><div class="grow"><div class="t">Поверх всех окон</div></div>${tgl('s-top', s.always_on_top)}</div>
@@ -820,9 +1077,17 @@ function buildSettings() {
   $('#s-top').onclick = async () => { await save({ always_on_top: !S.settings.always_on_top }, true); buildSettings(); };
   $('#s-tray').onclick = async () => { await save({ close_to_tray: !S.settings.close_to_tray }, true); buildSettings(); };
   $('#s-data').onclick = () => API.open_data_folder();
+  $('#s-phone-new').onclick = async () => { const r = await API.phone_rotate(); paintPhone(r); toast('Телефон нужно подключить заново', '', 2200); };
+  API.phone_info().then(paintPhone).catch(() => {});
   $('#s-vref').onclick = () => loadVersions(true);
-  $('#s-repo').onclick = () => API.open_link(S.repo || 'https://github.com/Sinohara1/jarvis-releases/releases');
+  $('#s-repo').onclick = () => API.open_link(S.repo || 'https://github.com/Sinohara1/jarvis/releases');
   if (S.versions) renderVersions(); else loadVersions(false);
+}
+
+function paintPhone(r) {
+  if (!r || !$('#s-phone-url')) return;
+  $('#s-phone-url').textContent = r.url ? `Открой на телефоне ${r.url} — та же Wi‑Fi, что у компьютера.` : (r.error || 'Пульт не запущен');
+  $('#s-phone-pin').textContent = r.pin || '······';
 }
 
 // ───────────────────────── versions (GitHub Releases) ─────────────────────────
@@ -929,6 +1194,7 @@ function bindStatic() {
   $('#live-wrap').onclick = (e) => { e.preventDefault(); toggleLive(); };
   $('#confirm-wrap').onclick = async (e) => { e.preventDefault(); await save({ confirm_actions: !S.settings.confirm_actions }, true); toast(S.settings.confirm_actions ? 'Буду спрашивать перед действиями' : 'Действую сразу', '', 1600); buildAI(); };
   $('#wake-btn').onclick = () => toggleWake();
+  $('#follow-chip').onclick = () => followStop();
   $('#voice-btn').onclick = async () => { const on = !S.settings.speak_replies; if (!on) API.stop_speaking(); await save({ speak_replies: on }, true); toast(on ? 'Голос включён' : 'Отвечаю только текстом', '', 1500); };
   $('#model-btn').onclick = (e) => popModel(e.currentTarget);
   $('#watch-btn').onclick = (e) => popWatch(e.currentTarget);

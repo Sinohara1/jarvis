@@ -21,6 +21,8 @@ def main() -> None:
     log = setup_logging(LOG_PATH)
     log.info("=== Jarvis %s starting (frozen=%s, py=%s) ===", APP_VERSION, getattr(sys, "frozen", False),
              sys.version.split()[0])
+    from .config import DATA_DIR, PORTABLE
+    log.info("data dir: %s (portable=%s)", DATA_DIR, PORTABLE)
 
     def excepthook(t, v, tb):
         log.error("uncaught", exc_info=(t, v, tb))
