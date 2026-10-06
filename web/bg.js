@@ -1,4 +1,4 @@
-// Animated monochrome marble/smoke background (WebGL1 domain-warped fbm).
+// Animated deep-navy reactor background (WebGL1 domain-warped fbm).
 // Renders at reduced resolution, ~30 fps cap, pauses when hidden.
 (function () {
   const canvas = document.getElementById('bg');
@@ -24,22 +24,20 @@ void main(){
   vec2 q=vec2(fbm(p+vec2(0.,0.)+t*.6),fbm(p+vec2(5.2,1.3)-t*.5));
   vec2 r=vec2(fbm(p+2.8*q+vec2(1.7,9.2)+t*.9),fbm(p+2.8*q+vec2(8.3,2.8)-t*.7));
   float f=fbm(p+3.2*r);
-  // soft smoke body
-  float c=smoothstep(.18,.92,f*1.08+.18*length(q)-.06);
-  // dark marble veins along iso-lines of the warp
-  float vein=abs(sin((f*7.0+r.x*3.0)*1.0));
-  vein=smoothstep(0.0,.16,vein);
-  c*=mix(.5,1.,vein);
-  // bright wisps
-  c+=.22*smoothstep(.62,.95,f)*(.6+.4*r.y);
-  // composition: brighter upper-middle, darker bottom-left corner (like the reference)
-  float lightField=.86+.30*smoothstep(-.2,1.0,uv.y)-.42*length((uv-vec2(.58,.66))*vec2(.95,1.2));
-  c=clamp(c,0.,1.);
-  c=mix(.17,.82,c)*clamp(lightField,.4,1.12);
-  c*=1.0+E*.12;
-  // tiny grain to avoid banding
-  c+= (h(gl_FragCoord.xy+T)-.5)*.018;
-  gl_FragColor=vec4(vec3(c),1.);
+  float c=smoothstep(.2,.9,f*1.05+.12*length(q));
+  float vein=abs(sin((f*6.0+r.x*2.4)*1.15));
+  vein=smoothstep(0.02,.22,vein);
+  vec3 deep=vec3(0.04,0.07,0.14);
+  vec3 mid=vec3(0.10,0.22,0.42);
+  vec3 glow=vec3(0.45,0.78,1.0);
+  vec3 amber=vec3(0.95,0.72,0.42);
+  vec3 col=mix(deep, mid, c);
+  col=mix(col, glow, (1.0-vein)*0.28*smoothstep(.35,.85,f));
+  float core=smoothstep(.55,.95,f)*smoothstep(1.15,.45,length(uv-vec2(.62,.58)));
+  col=mix(col, amber, core*.35);
+  col+=glow*(.08*E);
+  col+= (h(gl_FragCoord.xy+T)-.5)*.015;
+  gl_FragColor=vec4(col,1.);
 }`;
   function sh(type, src) {
     const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
@@ -63,7 +61,7 @@ void main(){
   let w = 0, h = 0;
   function resize() {
     const cw = window.innerWidth, ch = window.innerHeight;
-    const scale = Math.min(0.5, 640 / Math.max(1, cw));   // cap internal resolution
+    const scale = Math.min(0.5, 640 / Math.max(1, cw));
     const nw = Math.max(64, Math.round(cw * scale)), nh = Math.max(64, Math.round(ch * scale));
     if (nw !== w || nh !== h) { w = nw; h = nh; canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
   }
@@ -76,7 +74,7 @@ void main(){
     raf = 0;
     if (BG.paused || document.hidden) { return; }
     const dt = Math.min(0.1, (now - last) / 1000); last = now;
-    if (!BG.focused && BG.energy === 0 && now - BG.blurredAt > BG.idleFreezeMs) { return; }  // freeze in background
+    if (!BG.focused && BG.energy === 0 && now - BG.blurredAt > BG.idleFreezeMs) { return; }
     const target = 1 / (BG.focused || BG.energy > 0 ? BG.fps : BG.idleFps);
     acc += dt;
     if (acc >= target) {
@@ -95,7 +93,6 @@ void main(){
   window.addEventListener('focus', () => { BG.focused = true; kick(); });
   window.addEventListener('blur', () => { BG.focused = false; BG.blurredAt = performance.now(); });
   BG.focused = document.hasFocus(); BG.blurredAt = performance.now();
-  // static first frame immediately
   gl.uniform2f(uR, w, h); gl.uniform1f(uT, simT); gl.uniform1f(uE, 0); gl.drawArrays(gl.TRIANGLES, 0, 3);
   kick();
 })();
